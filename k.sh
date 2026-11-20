@@ -18,6 +18,7 @@ main() {
     local REALM="AU-TEAM.IRPO"
     local ADMIN_PASS="P@ssw0rd"
     local RAID_DISKS="sdb sdc"
+    local RAID_LEVEL="0"
     local ISO_DEV="/dev/sr0"
     local HQ_CLI_GID="10000"
     local TZ="Europe/Moscow"
@@ -52,7 +53,8 @@ main() {
         HQ-SRV)
             HQ_SRV_IP=$(ask "IP HQ-SRV" "$HQ_SRV_IP")
             BR_SRV_IP=$(ask "IP BR-SRV" "$BR_SRV_IP")
-            RAID_DISKS=$(ask "Диски для RAID (через пробел)" "$RAID_DISKS")
+            RAID_DISKS=$(ask "Диски для RAID (через пробел, например: sdb sdc)" "$RAID_DISKS")
+            RAID_LEVEL=$(ask "Уровень RAID (0, 1, 5, 10 и т.д.)" "$RAID_LEVEL")
             ISO_DEV=$(ask "Устройство ISO" "$ISO_DEV")
             ;;
         BR-SRV)
@@ -113,18 +115,23 @@ EOF
     }
 
     setup_raid() {
-        local disk1=$(echo "$RAID_DISKS" | awk '{print $1}')
-        local disk2=$(echo "$RAID_DISKS" | awk '{print $2}')
+        local dev_list=""
+        local disk_count=0
+        
+        for disk in $RAID_DISKS; do
+            dev_list="$dev_list /dev/$disk"
+            disk_count=$((disk_count + 1))
+            run "mdadm --zero-superblock --force /dev/$disk 2>/dev/null || true"
+            run "wipefs --all --force /dev/$disk"
+        done
 
-        run "mdadm --zero-superblock --force /dev/$disk1"
-        run "mdadm --zero-superblock --force /dev/$disk2"
-        run "wipefs --all --force /dev/$disk1"
-        run "wipefs --all --force /dev/$disk2"
-        run "mdadm --create /dev/md0 -l 0 -n 2 /dev/$disk1 /dev/$disk2"
+        run "mdadm --create /dev/md0 --level=$RAID_LEVEL --raid-devices=$disk_count $dev_list"
         run "mkfs -t ext4 /dev/md0"
+        
         run "mkdir -p /etc/mdadm"
         run "echo 'DEVICE partitions' > /etc/mdadm/mdadm.conf"
         run "mdadm --detail --scan | awk '/ARRAY/ {print}' >> /etc/mdadm/mdadm.conf"
+        
         run "mkdir -p /raid"
         run "echo '/dev/md0 /raid ext4 defaults 0 0' >> /etc/fstab"
         run "mount -a"
@@ -222,8 +229,29 @@ EOF
         sed -i "s/\$password = \".*\";/\$password = \"P@ssw0rd\";/" /var/www/html/index.php
         hist "nano /var/www/html/index.php"
 
-        run "systemctl enable --now httpd2"
-        run "systemctl restart httpd2"
+        cat > /etc/nginx/sites-available.d/default.conf <<EOF
+server {
+    listen 80;
+    server_name localhost;
+    root /var/www/html;
+    index index.php index.html;
+    
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+    
+    location ~ \.php$ {
+        include fastcgi_params;
+        fastcgi_pass unix:/run/php-fpm/php8.3-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+    }
+}
+EOF
+        hist "nano /etc/nginx/sites-available.d/default.conf"
+        
+        chown -R nginx:nginx /var/www/html
+        run "systemctl enable --now nginx php8.3-fpm"
+        run "systemctl restart nginx php8.3-fpm"
     }
 
     setup_dnat_hq() {
