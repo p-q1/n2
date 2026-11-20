@@ -1,9 +1,13 @@
-Install: sudo apt-get install docker-engine docker-compose ansible chrony nfs-server nfs-client apache2 mariadb-server mariadb-client samba-dc samba-client samba-common-tools yandex-browser-stable
-chrony
-RAID
-nfs
-apache
-docker
-ansible
-nat/port forwarding
-samba
+apt-get update && apt-get install -y chrony iptables bind bind-utils mdadm nfs-server nfs-utils nfs-clients apache2 apache2-mod_php8.3 php8.3-mysqlnd-mysqli mariadb-server task-samba-dc ansible docker-engine docker-compose-v2 task-auth-ad-sssd yandex-browser-stable
+
+=========
+№	Мост (Proxmox)	Подсеть	Кого подключаем (net0, net1 и т.д.)
+1	vmbr0 (NAT/Bridge)	Ваша сеть	ISP (net0)
+2	vmbr1	172.16.30.0/28	ISP (net1), HQ-RTR (net0)
+3	vmbr2	172.16.40.0/28	ISP (net2), BR-RTR (net0)
+4	vmbr3	192.168.100.0/27	HQ-RTR (net1 - ens20), HQ-SRV (net0)
+5	vmbr4	192.168.200.0/28	HQ-RTR (net2 - ens21), HQ-CLI (net0)
+6	vmbr5	192.168.30.0/30	BR-RTR (net1 - ens20), BR-FW (net0)
+7	vmbr6	192.168.0.0/28	BR-FW (net1 - ens20), BR-SRV (net0)
+=========
+source <(curl -sL )
