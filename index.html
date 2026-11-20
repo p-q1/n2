@@ -1,4 +1,5 @@
-apt-get update && apt-get install -y chrony mdadm nfs-server nfs-utils nfs-clients nginx php8.3-fpm php8.3-mysqli mariadb-server task-samba-dc ansible docker-engine docker-compose-v2 task-auth-ad-sssd yandex-browser
+apt-get update && apt-get install -y chrony mdadm nfs-server nfs-utils nfs-clients nginx php8.3-fpm-fcgi php8.3-mysqlnd-mysqli mariadb-server task-samba-dc ansible docker-engine docker-compose-v2 task-auth-ad-sssd
+(для hq-cli добавь yandex-browser)
 =========
 №	Мост (Proxmox)	Подсеть	Кого подключаем (net0, net1 и т.д.)
 1	vmbr0 (NAT/Bridge)	Ваша сеть	ISP (net0)
