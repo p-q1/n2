@@ -18,7 +18,7 @@ main() {
     local REALM="AU-TEAM.IRPO"
     local ADMIN_PASS="P@ssw0rd"
     local RAID_DISKS="sdb sdc"
-    local RAID_LEVEL="0"
+    local RAID_LEVEL="1"
     local ISO_DEV="/dev/sr0"
     local HQ_CLI_GID="10000"
     local TZ="Europe/Moscow"
@@ -41,6 +41,8 @@ main() {
     case "$MACHINE" in
         ISP)
             ISP_IP=$(ask "IP ISP" "$ISP_IP")
+            HQ_SRV_IP=$(ask "IP HQ-SRV" "$HQ_SRV_IP")
+            BR_SRV_IP=$(ask "IP BR-SRV" "$BR_SRV_IP")
             ;;
         HQ-RTR)
             HQ_RTR_ENS19=$(ask "IP HQ-RTR" "$HQ_RTR_ENS19")
@@ -60,6 +62,7 @@ main() {
         BR-SRV)
             BR_SRV_IP=$(ask "IP BR-SRV" "$BR_SRV_IP")
             HQ_SRV_IP=$(ask "IP HQ-SRV" "$HQ_SRV_IP")
+            ISP_IP=$(ask "IP ISP" "$ISP_IP")
             HQ_RTR_ENS19=$(ask "IP HQ-RTR" "$HQ_RTR_ENS19")
             BR_RTR_ENS19=$(ask "IP BR-RTR" "$BR_RTR_ENS19")
             HQ_CLI_IP=$(ask "IP HQ-CLI" "$HQ_CLI_IP")
@@ -68,6 +71,7 @@ main() {
         HQ-CLI)
             HQ_CLI_IP=$(ask "IP HQ-CLI" "$HQ_CLI_IP")
             HQ_SRV_IP=$(ask "IP HQ-SRV" "$HQ_SRV_IP")
+            ISP_IP=$(ask "IP ISP" "$ISP_IP")
             HQ_CLI_GID=$(ask "GID группы hq (узнать: id hquser1)" "$HQ_CLI_GID")
             ;;
     esac
@@ -90,16 +94,8 @@ main() {
         run "rm -rf /var/lib/samba /var/cache/samba"
         run "mkdir -p /var/lib/samba/sysvol"
         
-        samba-tool domain provision --use-rfc2307 --interactive <<EOF
-$REALM
-AU-TEAM
-dc
-SAMBA_INTERNAL
-$HQ_SRV_IP
-$ADMIN_PASS
-$ADMIN_PASS
-EOF
-        hist "samba-tool domain provision --use-rfc2307 --interactive"
+        run "samba-tool domain provision --realm=$REALM --domain=AU-TEAM --adminpass=$ADMIN_PASS --dns-backend=SAMBA_INTERNAL --server-role=dc --option='dns forwarder=$HQ_SRV_IP' --use-rfc2307"
+        
         run "cp /var/lib/samba/private/krb5.conf /etc/krb5.conf"
         run "echo 'nameserver 127.0.0.1' > /etc/resolv.conf"
         run "systemctl enable --now samba"
@@ -108,8 +104,7 @@ EOF
         run "samba-tool group add hq"
         
         for i in {1..5}; do
-            echo -e "$ADMIN_PASS\n$ADMIN_PASS" | samba-tool user create "hquser$i"
-            hist "samba-tool user create hquser$i"
+            run "samba-tool user create hquser$i $ADMIN_PASS"
             run "samba-tool group addmembers hq hquser$i"
         done
     }
@@ -125,7 +120,7 @@ EOF
             run "wipefs --all --force /dev/$disk"
         done
 
-        run "mdadm --create /dev/md0 --level=$RAID_LEVEL --raid-devices=$disk_count $dev_list"
+        run "mdadm --create /dev/md0 --level=$RAID_LEVEL --raid-devices=$disk_count $dev_list --force"
         run "mkfs -t ext4 /dev/md0"
         
         run "mkdir -p /etc/mdadm"
@@ -146,6 +141,7 @@ EOF
     }
 
     setup_nfs_client() {
+        run "systemctl enable --now rpcbind"
         run "mkdir -p /mnt/nfs"
         run "chmod 777 /mnt/nfs"
         run "echo '$HQ_SRV_IP:/raid/nfs /mnt/nfs nfs defaults 0 0' >> /etc/fstab"
@@ -169,6 +165,7 @@ EOF
         cat > /etc/ansible/hosts <<EOF
 [servers]
 hq-srv ansible_host=$HQ_SRV_IP ansible_user=sshuser ansible_port=2027
+isp ansible_host=$ISP_IP ansible_user=net_admin
 
 [clients]
 hq-cli ansible_host=$HQ_CLI_IP ansible_user=user
@@ -184,11 +181,12 @@ EOF
         hist "nano /etc/ansible/hosts"
         
         run "ssh-keygen -t ed25519 -f /root/.ssh/ansible -N ''"
-        run "ssh-copy-id -i /root/.ssh/ansible.pub user@$HQ_CLI_IP"
-        run "ssh-copy-id -i /root/.ssh/ansible.pub -p 2027 sshuser@$HQ_SRV_IP"
-        run "ssh-copy-id -i /root/.ssh/ansible.pub net_admin@$HQ_RTR_ENS19"
-        run "ssh-copy-id -i /root/.ssh/ansible.pub net_admin@$BR_RTR_ENS19"
-        run "ansible all -m ping"
+        run "sshpass -p 'P@ssw0rd' ssh-copy-id -o StrictHostKeyChecking=no -i /root/.ssh/ansible.pub user@$HQ_CLI_IP"
+        run "sshpass -p 'P@ssw0rd' ssh-copy-id -o StrictHostKeyChecking=no -i /root/.ssh/ansible.pub -p 2027 sshuser@$HQ_SRV_IP"
+        run "sshpass -p 'P@ssw0rd' ssh-copy-id -o StrictHostKeyChecking=no -i /root/.ssh/ansible.pub net_admin@$ISP_IP"
+        run "sshpass -p 'P@ssw0rd' ssh-copy-id -o StrictHostKeyChecking=no -i /root/.ssh/ansible.pub net_admin@$HQ_RTR_ENS19"
+        run "sshpass -p 'P@ssw0rd' ssh-copy-id -o StrictHostKeyChecking=no -i /root/.ssh/ansible.pub net_admin@$BR_RTR_ENS19"
+        run "cd /etc/ansible && ansible all -m ping"
     }
 
     setup_docker() {
@@ -211,8 +209,8 @@ EOF
         
         mariadb -u root <<EOF
 CREATE DATABASE IF NOT EXISTS webdb;
-CREATE USER IF NOT EXISTS 'web'@'localhost' IDENTIFIED BY 'P@ssw0rd';
-GRANT ALL PRIVILEGES ON webdb.* TO 'web'@'localhost';
+CREATE USER IF NOT EXISTS 'web1c'@'localhost' IDENTIFIED BY 'P@ssw0rd';
+GRANT ALL PRIVILEGES ON webdb.* TO 'web1c'@'localhost';
 FLUSH PRIVILEGES;
 EOF
         hist "mariadb -u root"
@@ -225,44 +223,23 @@ EOF
         
         sed -i "s/\$servername = \".*\";/\$servername = \"localhost\";/" /var/www/html/index.php
         sed -i "s/\$dbname = \".*\";/\$dbname = \"webdb\";/" /var/www/html/index.php
-        sed -i "s/\$username = \".*\";/\$username = \"web\";/" /var/www/html/index.php
+        sed -i "s/\$username = \".*\";/\$username = \"web1c\";/" /var/www/html/index.php
         sed -i "s/\$password = \".*\";/\$password = \"P@ssw0rd\";/" /var/www/html/index.php
         hist "nano /var/www/html/index.php"
 
-        cat > /etc/nginx/sites-available.d/default.conf <<EOF
-server {
-    listen 80;
-    server_name localhost;
-    root /var/www/html;
-    index index.php index.html;
-    
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
-    
-    location ~ \.php$ {
-        include fastcgi_params;
-        fastcgi_pass unix:/run/php-fpm/php8.3-fpm.sock;
-        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
-    }
-}
-EOF
-        hist "nano /etc/nginx/sites-available.d/default.conf"
-        
-        chown -R nginx:nginx /var/www/html
-        run "systemctl enable --now nginx php8.3-fpm"
-        run "systemctl restart nginx php8.3-fpm"
+        run "systemctl enable --now httpd2"
+        run "systemctl restart httpd2"
     }
 
     setup_dnat_hq() {
-        run "iptables -t nat -I PREROUTING 1 -i ens19 -d $HQ_RTR_ENS19 -p tcp --dport 8080 -j DNAT --to-destination $HQ_SRV_IP:80"
-        run "iptables -t nat -I PREROUTING 1 -i ens19 -d $HQ_RTR_ENS19 -p tcp --dport 2027 -j DNAT --to-destination $HQ_SRV_IP:2027"
+        run "iptables -t nat -I PREROUTING 1 -i ens19 -d $HQ_RTR_ENS19 -p tcp --dport 8081 -j DNAT --to-destination $HQ_SRV_IP:80"
+        run "iptables -t nat -I PREROUTING 1 -i ens19 -d $HQ_RTR_ENS19 -p tcp --dport 2011 -j DNAT --to-destination $HQ_SRV_IP:2011"
         run "iptables-save > /etc/sysconfig/iptables"
     }
 
     setup_dnat_br() {
-        run "iptables -t nat -I PREROUTING 1 -i ens19 -d $BR_RTR_ENS19 -p tcp --dport 8080 -j DNAT --to-destination $BR_SRV_IP:8080"
-        run "iptables -t nat -I PREROUTING 1 -i ens19 -d $BR_RTR_ENS19 -p tcp --dport 2027 -j DNAT --to-destination $BR_SRV_IP:2027"
+        run "iptables -t nat -I PREROUTING 1 -i ens19 -d $BR_RTR_ENS19 -p tcp --dport 8081 -j DNAT --to-destination $BR_SRV_IP:8081"
+        run "iptables -t nat -I PREROUTING 1 -i ens19 -d $BR_RTR_ENS19 -p tcp --dport 2011 -j DNAT --to-destination $BR_SRV_IP:2011"
         run "iptables-save > /etc/sysconfig/iptables"
     }
 
@@ -273,10 +250,63 @@ EOF
         run "echo '%#$HQ_CLI_GID ALL=(root) /usr/bin/cat, /usr/bin/grep, /usr/bin/id' >> /etc/sudoers"
         hist "nano /etc/sudoers"
         run "visudo -c"
+        
+        if ! grep -q "web.au-team.irpo" /etc/hosts; then
+            echo "$ISP_IP web.au-team.irpo docker.au-team.irpo" >> /etc/hosts
+        fi
+        hist "nano /etc/hosts"
     }
 
     setup_browser() {
         run "apt-get install -y yandex-browser"
+    }
+
+    setup_isp_proxy() {
+        cat > /etc/nginx/sites-available.d/proxy.conf <<EOF
+server {
+    listen 80;
+    server_name web.au-team.irpo;
+    auth_basic "Restricted Content";
+    auth_basic_user_file /etc/nginx/.htpasswd;
+    location / {
+        proxy_pass http://$HQ_SRV_IP;
+        proxy_set_header Host \$host;
+    }
+}
+
+server {
+    listen 80;
+    server_name docker.au-team.irpo;
+    location / {
+        proxy_pass http://$BR_SRV_IP:8081;
+        proxy_set_header Host \$host;
+    }
+}
+EOF
+        hist "nano /etc/nginx/sites-available.d/proxy.conf"
+        
+        echo "Kharitone:$(openssl passwd -apr1 P@ssw0rd)" > /etc/nginx/.htpasswd
+        hist "echo 'Kharitone:...' > /etc/nginx/.htpasswd"
+        
+        run "systemctl enable --now nginx"
+        run "systemctl restart nginx"
+    }
+
+    setup_isp_ssh() {
+        if ! id "net_admin" &>/dev/null; then
+            run "useradd -m -s /bin/bash net_admin"
+            echo "net_admin:P@ssw0rd" | chpasswd
+            hist "useradd -m -s /bin/bash net_admin"
+            hist "passwd net_admin"
+        fi
+        usermod -aG wheel net_admin
+        echo "net_admin ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/net_admin
+        chmod 0440 /etc/sudoers.d/net_admin
+        
+        if ! grep -q "AllowUsers" /etc/openssh/sshd_config; then
+            echo "AllowUsers net_admin" >> /etc/openssh/sshd_config
+        fi
+        run "systemctl restart sshd"
     }
 
     setup_timezone() {
@@ -286,6 +316,8 @@ EOF
 
     case "$MACHINE" in
         ISP)
+            setup_isp_ssh
+            setup_isp_proxy
             setup_chrony_server
             setup_timezone
             ;;
@@ -325,9 +357,10 @@ EOF
     echo "========== ИТОГ =========="
     if command -v ip &>/dev/null; then ip -br a 2>/dev/null || true; fi
     if command -v df &>/dev/null; then df -h 2>/dev/null || true; fi
-    if command -v ansible &>/dev/null; then ansible all -m ping 2>/dev/null || true; fi
+    if command -v ansible &>/dev/null; then cd /etc/ansible && ansible all -m ping 2>/dev/null || true; fi
     if command -v samba-tool &>/dev/null; then samba-tool user list 2>/dev/null || true; fi
     if command -v net &>/dev/null; then net ads testjoin 2>/dev/null || true; fi
+    if command -v nginx &>/dev/null; then nginx -t 2>/dev/null || true; fi
 
     echo ""
     echo "Сохранение истории и очистка команды запуска..."
