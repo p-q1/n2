@@ -96,7 +96,7 @@ main() {
         
         run "samba-tool domain provision --realm=$REALM --domain=AU-TEAM --adminpass=$ADMIN_PASS --dns-backend=SAMBA_INTERNAL --server-role=dc --option='dns forwarder=$HQ_SRV_IP' --use-rfc2307"
         
-        run "cp /var/lib/samba/private/krb5.conf /etc/krb5.conf"
+        run "cp -f /var/lib/samba/private/krb5.conf /etc/krb5.conf"
         run "echo 'nameserver 127.0.0.1' > /etc/resolv.conf"
         run "systemctl enable --now samba"
 
@@ -120,7 +120,7 @@ main() {
             run "wipefs --all --force /dev/$disk"
         done
 
-        run "mdadm --create /dev/md0 --level=$RAID_LEVEL --raid-devices=$disk_count $dev_list --force"
+        run "mdadm --create /dev/md0 --level=$RAID_LEVEL --raid-devices=$disk_count $dev_list --bitmap=none --force"
         run "mkfs -t ext4 /dev/md0"
         
         run "mkdir -p /etc/mdadm"
@@ -141,10 +141,9 @@ main() {
     }
 
     setup_nfs_client() {
-        run "systemctl enable --now rpcbind"
         run "mkdir -p /mnt/nfs"
         run "chmod 777 /mnt/nfs"
-        run "echo '$HQ_SRV_IP:/raid/nfs /mnt/nfs nfs defaults 0 0' >> /etc/fstab"
+        run "echo '$HQ_SRV_IP:/raid/nfs /mnt/nfs nfs defaults,nolock 0 0' >> /etc/fstab"
         run "mount -a"
     }
 
@@ -165,7 +164,6 @@ main() {
         cat > /etc/ansible/hosts <<EOF
 [servers]
 hq-srv ansible_host=$HQ_SRV_IP ansible_user=sshuser ansible_port=2027
-isp ansible_host=$ISP_IP ansible_user=net_admin
 
 [clients]
 hq-cli ansible_host=$HQ_CLI_IP ansible_user=user
@@ -173,6 +171,9 @@ hq-cli ansible_host=$HQ_CLI_IP ansible_user=user
 [routers]
 hq-rtr ansible_host=$HQ_RTR_ENS19 ansible_user=net_admin
 br-rtr ansible_host=$BR_RTR_ENS19 ansible_user=net_admin
+
+[isp]
+isp ansible_host=$ISP_IP ansible_user=net_admin
 
 [all:vars]
 ansible_python_interpreter=/usr/bin/python3
@@ -244,6 +245,7 @@ EOF
     }
 
     setup_domain_join() {
+        run "echo 'nameserver $HQ_SRV_IP' > /etc/resolv.conf"
         run "system-auth write ad $DOMAIN hq-cli AU-TEAM Administrator $ADMIN_PASS"
         run "net ads testjoin"
         run "control sudo public"
