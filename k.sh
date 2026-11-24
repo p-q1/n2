@@ -183,7 +183,10 @@ m2_main() {
                     --adminpass="$admin_pass"
                 m2_hist "samba-tool domain provision --use-rfc2307 --realm=${DOMAIN_REALM} --domain=${WORKGROUP_NAME} --server-role=dc --dns-backend=SAMBA_INTERNAL --option=\"dns forwarder = ${HQ_SRV_IP}\""
 
-                [ -f /var/lib/samba/private/krb5.conf ] && cp -f /var/lib/samba/private/krb5.conf /etc/krb5.conf && m2_hist "cp /var/lib/samba/private/krb5.conf /etc/krb5.conf"
+                if [ -f /var/lib/samba/private/krb5.conf ]; then
+                    \cp -f /var/lib/samba/private/krb5.conf /etc/krb5.conf
+                    m2_hist "cp -f /var/lib/samba/private/krb5.conf /etc/krb5.conf"
+                fi
                 echo "nameserver 127.0.0.1" > /etc/resolv.conf
                 m2_hist "nano /etc/resolv.conf"
                 m2_run "systemctl enable --now samba"
@@ -329,8 +332,9 @@ EOF
     }
 
     m2_ssh_push_target() {
-        local label="$1" ip="$2" def_user="$3" def_port="$4"
-        local u p pass
+        local label="$1" def_ip="$2" def_user="$3" def_port="$4"
+        local ip u p pass
+        ip="$(m2_ask "$label: IP-адрес" "$def_ip")"
         u="$(m2_ask "$label: пользователь (AllowUsers)" "$def_user")"
         p="$(m2_ask "$label: порт SSH" "$def_port")"
         pass="$(m2_ask_secret "$label ($u@$ip:$p): пароль для sshpass" "P@ssw0rd")"
@@ -339,7 +343,7 @@ EOF
             sshpass -p "$pass" ssh-copy-id -o StrictHostKeyChecking=no -p "$p" -i /root/.ssh/ansible.pub "${u}@${ip}" 2>/dev/null || true
             m2_hist "ssh-copy-id -i /root/.ssh/ansible.pub -p $p ${u}@${ip}"
         fi
-        echo "${u}|${p}"
+        echo "${ip}|${u}|${p}"
     }
 
     m2_step5_ansible() {
@@ -351,10 +355,20 @@ EOF
         fi
 
         local hq_srv_cfg hq_cli_cfg hq_rtr_cfg br_rtr_cfg
+        local hq_srv_ip hq_srv_u hq_srv_p
+        local hq_cli_ip hq_cli_u hq_cli_p
+        local hq_rtr_ip hq_rtr_u hq_rtr_p
+        local br_rtr_ip br_rtr_u br_rtr_p
+
         hq_srv_cfg="$(m2_ssh_push_target "HQ-SRV" "$HQ_SRV_IP" "sshuser" "$SSH_PORT_DEFAULT")"
         hq_cli_cfg="$(m2_ssh_push_target "HQ-CLI" "$HQ_CLI_IP_FALLBACK" "sshuser" "22")"
         hq_rtr_cfg="$(m2_ssh_push_target "HQ-RTR" "$HQ_RTR_IP" "net_admin" "22")"
         br_rtr_cfg="$(m2_ssh_push_target "BR-RTR" "$BR_RTR_IP" "net_admin" "22")"
+
+        IFS='|' read -r hq_srv_ip hq_srv_u hq_srv_p <<< "$hq_srv_cfg"
+        IFS='|' read -r hq_cli_ip hq_cli_u hq_cli_p <<< "$hq_cli_cfg"
+        IFS='|' read -r hq_rtr_ip hq_rtr_u hq_rtr_p <<< "$hq_rtr_cfg"
+        IFS='|' read -r br_rtr_ip br_rtr_u br_rtr_p <<< "$br_rtr_cfg"
 
         mkdir -p /etc/ansible
         cat > /etc/ansible/ansible.cfg <<EOF
@@ -367,14 +381,14 @@ EOF
 
         cat > /etc/ansible/hosts <<EOF
 [servers]
-hq-srv ansible_host=${HQ_SRV_IP} ansible_user=${hq_srv_cfg%%|*} ansible_port=${hq_srv_cfg##*|}
+hq-srv ansible_host=${hq_srv_ip} ansible_user=${hq_srv_u} ansible_port=${hq_srv_p}
 
 [clients]
-hq-cli ansible_host=${HQ_CLI_IP_FALLBACK} ansible_user=${hq_cli_cfg%%|*} ansible_port=${hq_cli_cfg##*|}
+hq-cli ansible_host=${hq_cli_ip} ansible_user=${hq_cli_u} ansible_port=${hq_cli_p}
 
 [routers]
-hq-rtr ansible_host=${HQ_RTR_IP} ansible_user=${hq_rtr_cfg%%|*} ansible_port=${hq_rtr_cfg##*|}
-br-rtr ansible_host=${BR_RTR_IP} ansible_user=${br_rtr_cfg%%|*} ansible_port=${br_rtr_cfg##*|}
+hq-rtr ansible_host=${hq_rtr_ip} ansible_user=${hq_rtr_u} ansible_port=${hq_rtr_p}
+br-rtr ansible_host=${br_rtr_ip} ansible_user=${br_rtr_u} ansible_port=${br_rtr_p}
 
 [all:vars]
 ansible_python_interpreter=/usr/bin/python3
@@ -391,13 +405,16 @@ EOF
         mkdir -p /root/testapp
 
         if m2_mount_iso; then
-            [ -d "$ISO_MOUNT/docker" ] && cp -a "$ISO_MOUNT/docker/." /root/testapp/ && m2_hist "cp -a $ISO_MOUNT/docker/. /root/testapp/"
+            if [ -d "$ISO_MOUNT/docker" ]; then
+                \cp -a "$ISO_MOUNT/docker/." /root/testapp/
+                m2_hist "cp -a $ISO_MOUNT/docker/. /root/testapp/"
+            fi
             if [ -f "$ISO_MOUNT/compose.yaml" ]; then
-                cp -f "$ISO_MOUNT/compose.yaml" /root/testapp/compose.yaml
-                m2_hist "cp $ISO_MOUNT/compose.yaml /root/testapp/compose.yaml"
+                \cp -f "$ISO_MOUNT/compose.yaml" /root/testapp/compose.yaml
+                m2_hist "cp -f $ISO_MOUNT/compose.yaml /root/testapp/compose.yaml"
             elif [ -f "$ISO_MOUNT/docker/compose.yaml" ]; then
-                cp -f "$ISO_MOUNT/docker/compose.yaml" /root/testapp/compose.yaml
-                m2_hist "cp $ISO_MOUNT/docker/compose.yaml /root/testapp/compose.yaml"
+                \cp -f "$ISO_MOUNT/docker/compose.yaml" /root/testapp/compose.yaml
+                m2_hist "cp -f $ISO_MOUNT/docker/compose.yaml /root/testapp/compose.yaml"
             fi
         fi
 
@@ -458,12 +475,12 @@ SQL
                 m2_hist "mariadb -u root webdb < $ISO_MOUNT/web/dump.sql"
             fi
             if [ -f "$ISO_MOUNT/web/index.php" ]; then
-                cp -f "$ISO_MOUNT/web/index.php" /var/www/html/index.php
-                m2_hist "cp $ISO_MOUNT/web/index.php /var/www/html/index.php"
+                \cp -f "$ISO_MOUNT/web/index.php" /var/www/html/index.php
+                m2_hist "cp -f $ISO_MOUNT/web/index.php /var/www/html/index.php"
             fi
             if [ -f "$ISO_MOUNT/web/logo.png" ]; then
-                cp -f "$ISO_MOUNT/web/logo.png" /var/www/html/logo.png
-                m2_hist "cp $ISO_MOUNT/web/logo.png /var/www/html/logo.png"
+                \cp -f "$ISO_MOUNT/web/logo.png" /var/www/html/logo.png
+                m2_hist "cp -f $ISO_MOUNT/web/logo.png /var/www/html/logo.png"
             fi
         fi
 
