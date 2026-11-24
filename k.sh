@@ -102,7 +102,7 @@ m2_main() {
         esac
     }
 
-    m2_check_packages() {
+    m2_ensure_packages() {
         local role="$1"
         local req_pkgs missing="" pkg
         req_pkgs="$(m2_role_pkg_list "$role")"
@@ -120,12 +120,23 @@ m2_main() {
         fi
 
         if [ -n "$missing" ]; then
-            echo "Не хватает пакетов:$missing"
-            if [ "$(m2_ask_yn "Остановить скрипт для ручной установки? (д/н)" "д")" = "y" ]; then
-                return 1
-            fi
+            echo "Автоустановка недостающих пакетов:$missing"
+            m2_run "apt-get update"
+            local m
+            for m in $missing; do
+                if [ "$m" = "yandex-browser-stable" ]; then
+                    if apt-cache show yandex-browser-stable >/dev/null 2>&1; then
+                        m2_run "apt-get install -y yandex-browser-stable"
+                    elif apt-cache show yandex-browser >/dev/null 2>&1; then
+                        m2_run "apt-get install -y yandex-browser"
+                    else
+                        echo "Пакет Яндекс Браузера не найден в apt."
+                    fi
+                else
+                    apt-get install -y "$m" && m2_hist "apt-get install -y $m" || echo "Не удалось поставить $m"
+                fi
+            done
         fi
-        return 0
     }
 
     m2_mount_iso() {
@@ -136,6 +147,7 @@ m2_main() {
         local dev
         for dev in /dev/sr0 /dev/sr1 /dev/cdrom; do
             if [ -b "$dev" ] && mount -o ro "$dev" "$ISO_MOUNT" 2>/dev/null; then
+                m2_hist "mount -o ro $dev $ISO_MOUNT"
                 return 0
             fi
         done
@@ -152,22 +164,28 @@ m2_main() {
             if ! systemctl is-active --quiet samba 2>/dev/null; then
                 if [ -z "$(awk '/^nameserver/{print $2}' /etc/resolv.conf 2>/dev/null)" ]; then
                     echo "nameserver $HQ_SRV_IP" > /etc/resolv.conf
+                    m2_hist "nano /etc/resolv.conf"
                 fi
                 systemctl stop samba 2>/dev/null || true
                 rm -f /etc/samba/smb.conf
                 rm -rf /var/lib/samba/* /var/cache/samba/*
                 mkdir -p /var/lib/samba/sysvol
                 hostnamectl set-hostname "br-srv.${DOMAIN_NAME}" 2>/dev/null || true
+                m2_hist "hostnamectl set-hostname br-srv.${DOMAIN_NAME}"
+
                 samba-tool domain provision \
                     --use-rfc2307 \
                     --realm="$DOMAIN_REALM" \
                     --domain="$WORKGROUP_NAME" \
                     --server-role=dc \
                     --dns-backend=SAMBA_INTERNAL \
-                    --dns-forwarder="$HQ_SRV_IP" \
+                    --option="dns forwarder = ${HQ_SRV_IP}" \
                     --adminpass="$admin_pass"
-                [ -f /var/lib/samba/private/krb5.conf ] && cp -f /var/lib/samba/private/krb5.conf /etc/krb5.conf
+                m2_hist "samba-tool domain provision --use-rfc2307 --realm=${DOMAIN_REALM} --domain=${WORKGROUP_NAME} --server-role=dc --dns-backend=SAMBA_INTERNAL --option=\"dns forwarder = ${HQ_SRV_IP}\""
+
+                [ -f /var/lib/samba/private/krb5.conf ] && cp -f /var/lib/samba/private/krb5.conf /etc/krb5.conf && m2_hist "cp /var/lib/samba/private/krb5.conf /etc/krb5.conf"
                 echo "nameserver 127.0.0.1" > /etc/resolv.conf
+                m2_hist "nano /etc/resolv.conf"
                 m2_run "systemctl enable --now samba"
             fi
 
@@ -176,13 +194,17 @@ m2_main() {
                 --account-lockout-threshold=5 \
                 --account-lockout-duration=30 \
                 --reset-account-lockout-after=30 2>/dev/null || true
+            m2_hist "samba-tool domain passwordsettings set --min-pwd-length=8 --account-lockout-threshold=5 --account-lockout-duration=30 --reset-account-lockout-after=30"
 
             samba-tool group add hq 2>/dev/null || true
+            m2_hist "samba-tool group add hq"
             local i uname
             for i in 1 2 3 4 5; do
                 uname="hquser${i}"
                 samba-tool user create "$uname" "$user_pass" 2>/dev/null || true
+                m2_hist "samba-tool user create $uname"
                 samba-tool group addmembers hq "$uname" 2>/dev/null || true
+                m2_hist "samba-tool group addmembers hq $uname"
             done
         elif [ "$role" = "HQ-CLI" ]; then
             local admin_pass
@@ -190,12 +212,15 @@ m2_main() {
 
             if command -v system-auth >/dev/null 2>&1; then
                 system-auth write ad "$DOMAIN_NAME" "hq-cli" "$WORKGROUP_NAME" Administrator "$admin_pass" 2>/dev/null || true
+                m2_hist "system-auth write ad ${DOMAIN_NAME} hq-cli ${WORKGROUP_NAME} Administrator"
             elif command -v net >/dev/null 2>&1; then
                 net ads join -U "Administrator%${admin_pass}" 2>/dev/null || true
                 net ads testjoin 2>/dev/null || true
+                m2_hist "net ads testjoin"
             fi
 
             control sudo public 2>/dev/null || true
+            m2_hist "control sudo public"
             local gid_num
             gid_num="$(getent group hq 2>/dev/null | awk -F: '{print $3}')"
             if [ -z "$gid_num" ]; then
@@ -211,7 +236,8 @@ EOF
 EOF
             fi
             chmod 0440 /etc/sudoers.d/hq_group
-            visudo -c 2>/dev/null || true
+            m2_hist "visudo"
+            visudo -c 2>/dev/null && m2_hist "visudo -c" || true
         fi
     }
 
@@ -228,21 +254,27 @@ EOF
         fi
 
         mdadm --zero-superblock --force "$d1" "$d2" 2>/dev/null || true
+        m2_hist "mdadm --zero-superblock --force $d1 $d2"
         wipefs --all --force "$d1" "$d2" 2>/dev/null || true
+        m2_hist "wipefs --all --force $d1 $d2"
 
         if [ ! -e /dev/md0 ]; then
             m2_run "mdadm --create /dev/md0 --level=0 --raid-devices=2 $d1 $d2 --run"
         fi
 
         mkfs -t ext4 -F /dev/md0 2>/dev/null || true
+        m2_hist "mkfs -t ext4 /dev/md0"
         mkdir -p /etc/mdadm /raid
         echo "DEVICE partitions" > /etc/mdadm/mdadm.conf
         mdadm --detail --scan 2>/dev/null | awk '/ARRAY/ {print}' >> /etc/mdadm/mdadm.conf
+        m2_hist "nano /etc/mdadm/mdadm.conf"
 
         if ! grep -q '[[:space:]]/raid[[:space:]]' /etc/fstab 2>/dev/null; then
             echo "/dev/md0 /raid ext4 defaults 0 0" >> /etc/fstab
+            m2_hist "nano /etc/fstab"
         fi
         m2_run "mount -a"
+        m2_hist "df -h /raid"
     }
 
     m2_step3_nfs() {
@@ -250,18 +282,23 @@ EOF
         if [ "$role" = "HQ-SRV" ]; then
             mkdir -p /raid/nfs
             chmod 0777 /raid/nfs
+            m2_hist "mkdir -p /raid/nfs && chmod 0777 /raid/nfs"
             if ! grep -q "^/raid/nfs[[:space:]]" /etc/exports 2>/dev/null; then
                 echo "/raid/nfs ${HQ_CLI_NET}(rw,no_root_squash,sync)" >> /etc/exports
+                m2_hist "nano /etc/exports"
             fi
             m2_run "exportfs -arv"
             m2_run "systemctl enable --now nfs-server"
         elif [ "$role" = "HQ-CLI" ]; then
             mkdir -p /mnt/nfs
             chmod 0777 /mnt/nfs
+            m2_hist "mkdir -p /mnt/nfs && chmod 0777 /mnt/nfs"
             if ! grep -q "[[:space:]]/mnt/nfs[[:space:]]" /etc/fstab 2>/dev/null; then
                 echo "${HQ_SRV_IP}:/raid/nfs /mnt/nfs nfs defaults 0 0" >> /etc/fstab
+                m2_hist "nano /etc/fstab"
             fi
             m2_run "mount -a"
+            m2_hist "df -h /mnt/nfs"
         fi
     }
 
@@ -285,8 +322,10 @@ makestep 1.0 3
 rtcsync
 EOF
         fi
+        m2_hist "nano /etc/chrony.conf"
         m2_run "systemctl enable --now chronyd"
         m2_run "systemctl restart chronyd"
+        m2_hist "chronyc sources"
     }
 
     m2_ssh_push_target() {
@@ -298,6 +337,7 @@ EOF
 
         if command -v sshpass >/dev/null 2>&1; then
             sshpass -p "$pass" ssh-copy-id -o StrictHostKeyChecking=no -p "$p" -i /root/.ssh/ansible.pub "${u}@${ip}" 2>/dev/null || true
+            m2_hist "ssh-copy-id -i /root/.ssh/ansible.pub -p $p ${u}@${ip}"
         fi
         echo "${u}|${p}"
     }
@@ -307,6 +347,7 @@ EOF
             mkdir -p /root/.ssh
             chmod 0700 /root/.ssh
             ssh-keygen -t ed25519 -f /root/.ssh/ansible -N ""
+            m2_hist "ssh-keygen -t ed25519 -f /root/.ssh/ansible -N \"\""
         fi
 
         local hq_srv_cfg hq_cli_cfg hq_rtr_cfg br_rtr_cfg
@@ -322,6 +363,7 @@ inventory = /etc/ansible/hosts
 host_key_checking = False
 interpreter_python = /usr/bin/python3
 EOF
+        m2_hist "nano /etc/ansible/ansible.cfg"
 
         cat > /etc/ansible/hosts <<EOF
 [servers]
@@ -338,8 +380,10 @@ br-rtr ansible_host=${BR_RTR_IP} ansible_user=${br_rtr_cfg%%|*} ansible_port=${b
 ansible_python_interpreter=/usr/bin/python3
 ansible_ssh_private_key_file=/root/.ssh/ansible
 EOF
+        m2_hist "nano /etc/ansible/hosts"
 
         (cd /etc/ansible && ansible all -m ping) 2>/dev/null || true
+        m2_hist "cd /etc/ansible && ansible all -m ping"
     }
 
     m2_step6_docker_app() {
@@ -347,17 +391,22 @@ EOF
         mkdir -p /root/testapp
 
         if m2_mount_iso; then
-            [ -d "$ISO_MOUNT/docker" ] && cp -a "$ISO_MOUNT/docker/." /root/testapp/
+            [ -d "$ISO_MOUNT/docker" ] && cp -a "$ISO_MOUNT/docker/." /root/testapp/ && m2_hist "cp -a $ISO_MOUNT/docker/. /root/testapp/"
             if [ -f "$ISO_MOUNT/compose.yaml" ]; then
                 cp -f "$ISO_MOUNT/compose.yaml" /root/testapp/compose.yaml
+                m2_hist "cp $ISO_MOUNT/compose.yaml /root/testapp/compose.yaml"
             elif [ -f "$ISO_MOUNT/docker/compose.yaml" ]; then
                 cp -f "$ISO_MOUNT/docker/compose.yaml" /root/testapp/compose.yaml
+                m2_hist "cp $ISO_MOUNT/docker/compose.yaml /root/testapp/compose.yaml"
             fi
         fi
 
         local f
         for f in /root/testapp/*.tar; do
-            [ -f "$f" ] && docker load -i "$f" >/dev/null
+            if [ -f "$f" ]; then
+                docker load -i "$f" >/dev/null
+                m2_hist "docker load -i $f"
+            fi
         done
 
         if [ ! -f /root/testapp/compose.yaml ]; then
@@ -380,10 +429,13 @@ services:
       - db
     restart: unless-stopped
 EOF
+            m2_hist "nano /root/testapp/compose.yaml"
         fi
 
         (cd /root/testapp && docker compose -p testapp up -d)
+        m2_hist "cd /root/testapp && docker compose -p testapp up -d"
         docker ps 2>/dev/null || true
+        m2_hist "docker ps"
     }
 
     m2_step7_web_app() {
@@ -394,14 +446,25 @@ CREATE USER IF NOT EXISTS 'web'@'localhost' IDENTIFIED BY 'P@ssw0rd';
 GRANT ALL PRIVILEGES ON webdb.* TO 'web'@'localhost';
 FLUSH PRIVILEGES;
 SQL
+        m2_hist "mariadb -u root"
 
         mkdir -p /var/www/html
         rm -f /var/www/html/index.html
+        m2_hist "rm -f /var/www/html/index.html"
 
         if m2_mount_iso; then
-            [ -f "$ISO_MOUNT/web/dump.sql" ] && mariadb -u root webdb < "$ISO_MOUNT/web/dump.sql"
-            [ -f "$ISO_MOUNT/web/index.php" ] && cp -f "$ISO_MOUNT/web/index.php" /var/www/html/index.php
-            [ -f "$ISO_MOUNT/web/logo.png" ] && cp -f "$ISO_MOUNT/web/logo.png" /var/www/html/logo.png
+            if [ -f "$ISO_MOUNT/web/dump.sql" ]; then
+                mariadb -u root webdb < "$ISO_MOUNT/web/dump.sql"
+                m2_hist "mariadb -u root webdb < $ISO_MOUNT/web/dump.sql"
+            fi
+            if [ -f "$ISO_MOUNT/web/index.php" ]; then
+                cp -f "$ISO_MOUNT/web/index.php" /var/www/html/index.php
+                m2_hist "cp $ISO_MOUNT/web/index.php /var/www/html/index.php"
+            fi
+            if [ -f "$ISO_MOUNT/web/logo.png" ]; then
+                cp -f "$ISO_MOUNT/web/logo.png" /var/www/html/logo.png
+                m2_hist "cp $ISO_MOUNT/web/logo.png /var/www/html/logo.png"
+            fi
         fi
 
         if [ -f /var/www/html/index.php ]; then
@@ -412,6 +475,7 @@ SQL
                 -e "s/('|\")P@ssw0rd('|\")/'P@ssw0rd'/g" \
                 /var/www/html/index.php
             chmod 0644 /var/www/html/index.php
+            m2_hist "nano /var/www/html/index.php"
         fi
         [ -f /var/www/html/logo.png ] && chmod 0644 /var/www/html/logo.png
 
@@ -423,12 +487,16 @@ SQL
         local role="$1"
         if [ "$role" = "HQ-RTR" ]; then
             iptables -t nat -I PREROUTING 1 -p tcp --dport 8080 -j DNAT --to-destination "${HQ_SRV_IP}:80"
+            m2_hist "iptables -t nat -I PREROUTING 1 -p tcp --dport 8080 -j DNAT --to-destination ${HQ_SRV_IP}:80"
             iptables -t nat -I PREROUTING 1 -p tcp --dport "${SSH_PORT_DEFAULT}" -j DNAT --to-destination "${HQ_SRV_IP}:${SSH_PORT_DEFAULT}"
+            m2_hist "iptables -t nat -I PREROUTING 1 -p tcp --dport ${SSH_PORT_DEFAULT} -j DNAT --to-destination ${HQ_SRV_IP}:${SSH_PORT_DEFAULT}"
             mkdir -p /etc/sysconfig
             m2_run "iptables-save > /etc/sysconfig/iptables"
         elif [ "$role" = "BR-RTR" ]; then
             iptables -t nat -I PREROUTING 1 -p tcp --dport 8080 -j DNAT --to-destination "${BR_SRV_IP}:8080"
+            m2_hist "iptables -t nat -I PREROUTING 1 -p tcp --dport 8080 -j DNAT --to-destination ${BR_SRV_IP}:8080"
             iptables -t nat -I PREROUTING 1 -p tcp --dport "${SSH_PORT_DEFAULT}" -j DNAT --to-destination "${BR_SRV_IP}:${SSH_PORT_DEFAULT}"
+            m2_hist "iptables -t nat -I PREROUTING 1 -p tcp --dport ${SSH_PORT_DEFAULT} -j DNAT --to-destination ${BR_SRV_IP}:${SSH_PORT_DEFAULT}"
             mkdir -p /etc/sysconfig
             m2_run "iptables-save > /etc/sysconfig/iptables"
         fi
@@ -449,6 +517,7 @@ SQL
             elif command -v openssl >/dev/null 2>&1; then
                 printf "%s:%s\n" "$auth_user" "$(openssl passwd -apr1 "$auth_pass" 2>/dev/null || openssl passwd -6 "$auth_pass")" > /etc/nginx/.htpasswd
             fi
+            m2_hist "htpasswd -bc /etc/nginx/.htpasswd $auth_user"
 
             cat > /etc/nginx/sites-available.d/proxy.conf <<EOF
 server {
@@ -476,15 +545,16 @@ server {
     }
 }
 EOF
+            m2_hist "nano /etc/nginx/sites-available.d/proxy.conf"
             ln -sf /etc/nginx/sites-available.d/proxy.conf /etc/nginx/sites-enabled.d/proxy.conf
             m2_run "systemctl enable --now nginx"
             m2_run "systemctl restart nginx"
-            echo "На HQ-CLI добавьте в /etc/hosts: ${isp_ip} web.${DOMAIN_NAME} docker.${DOMAIN_NAME}"
         elif [ "$role" = "HQ-CLI" ]; then
             local isp_ip
             isp_ip="$(m2_ask "IP адрес ISP для /etc/hosts" "172.16.1.1")"
             if ! grep -q "web.${DOMAIN_NAME}" /etc/hosts 2>/dev/null; then
                 echo "${isp_ip} web.${DOMAIN_NAME} docker.${DOMAIN_NAME}" >> /etc/hosts
+                m2_hist "nano /etc/hosts"
             fi
         fi
     }
@@ -499,7 +569,7 @@ EOF
         done
     fi
 
-    m2_check_packages "$ROLE" || return 1
+    m2_ensure_packages "$ROLE"
 
     echo "1 — Все задачи для $ROLE"
     echo "2 — Конкретный пункт (1..8 или n)"
@@ -555,19 +625,18 @@ EOF
         esac
     fi
 
-    if [ "$(m2_ask_yn "Очистить следы скрипта из истории команд? (д/н)" "д")" = "y" ]; then
-        history -a
-        if [ -f "$HOME/.bash_history" ]; then
-            sed -i -E '/(curl|clck\.ru|source[[:space:]]+<\(|module2\.sh|githubusercontent|bash[[:space:]]+<)/d' "$HOME/.bash_history"
-        fi
-        history -c
-        history -r "$HOME/.bash_history"
+    history -a
+    if [ -f "$HOME/.bash_history" ]; then
+        sed -i -E '/(curl|clck\.ru|source[[:space:]]+<\(|module2\.sh|githubusercontent|bash[[:space:]]+<)/d' "$HOME/.bash_history"
     fi
+    history -c
+    history -r "$HOME/.bash_history"
 
-    if [ "$(m2_ask_yn "Перезагрузить машину сейчас? (д/н)" "н")" = "y" ]; then
-        sync
-        reboot
-    fi
+    echo ""
+    echo "Готово. Перезагрузка через 3 сек."
+    sync
+    sleep 3
+    reboot
 }
 
 m2_main "$@"
