@@ -78,31 +78,6 @@ m2_main() {
         esac
     }
 
-    m2_discover_state() {
-        echo "Состояние узла:"
-        echo "Хост: $(hostname -f 2>/dev/null || hostname)"
-        echo "Адреса:"
-        ip -4 -br a 2>/dev/null || true
-        echo "Маршруты:"
-        ip -4 route 2>/dev/null || true
-
-        local svcs="chronyd nfs-server docker httpd2 apache2 mariadb nginx named bind dhcpd frr samba"
-        local active_list=""
-        local s
-        for s in $svcs; do
-            if systemctl is-active --quiet "$s" 2>/dev/null; then
-                active_list="$active_list $s"
-            fi
-        done
-        echo "Активные службы:${active_list:- нет}"
-
-        if [ -f /etc/resolv.conf ]; then
-            local ns
-            ns="$(awk '/^nameserver/{print $2}' /etc/resolv.conf | tr '\n' ' ')"
-            echo "DNS nameserver: ${ns:-не задан}"
-        fi
-    }
-
     m2_role_pkg_list() {
         local role="$1"
         case "$role" in
@@ -145,13 +120,10 @@ m2_main() {
         fi
 
         if [ -n "$missing" ]; then
-            echo "Не установлены пакеты для $role:$missing"
-            if [ "$(m2_ask_yn "Остановить скрипт для ручной установки пакетов? (д/н)" "д")" = "y" ]; then
-                echo "Скрипт остановлен. Установите недостающие пакеты и запустите скрипт снова."
+            echo "Не хватает пакетов:$missing"
+            if [ "$(m2_ask_yn "Остановить скрипт для ручной установки? (д/н)" "д")" = "y" ]; then
                 return 1
             fi
-        else
-            echo "Все нужные пакеты для $role уже установлены."
         fi
         return 0
     }
@@ -163,39 +135,16 @@ m2_main() {
         fi
         local dev
         for dev in /dev/sr0 /dev/sr1 /dev/cdrom; do
-            if [ -b "$dev" ]; then
-                if mount -o ro "$dev" "$ISO_MOUNT" 2>/dev/null; then
-                    echo "Смонтирован $dev в $ISO_MOUNT"
-                    return 0
-                fi
+            if [ -b "$dev" ] && mount -o ro "$dev" "$ISO_MOUNT" 2>/dev/null; then
+                return 0
             fi
         done
-        echo "Образ Additional.iso не найден или не смонтирован."
         return 1
-    }
-
-    m2_install_role_pkgs() {
-        local role="$1"
-        local pkgs
-        pkgs="$(m2_role_pkg_list "$role")"
-
-        m2_run "apt-get update && apt-get install -y $pkgs"
-
-        if [ "$role" = "HQ-CLI" ]; then
-            if apt-cache show yandex-browser-stable >/dev/null 2>&1; then
-                m2_run "apt-get install -y yandex-browser-stable"
-            elif apt-cache show yandex-browser >/dev/null 2>&1; then
-                m2_run "apt-get install -y yandex-browser"
-            else
-                echo "Пакет Яндекс Браузера не найден в текущих репозиториях apt."
-            fi
-        fi
     }
 
     m2_step1_samba_ad() {
         local role="$1"
         if [ "$role" = "BR-SRV" ]; then
-            echo "Настройка Samba DC и пользователей на BR-SRV"
             local admin_pass user_pass
             admin_pass="$(m2_ask_secret "Пароль Администратора домена" "P@ssw0rd")"
             user_pass="$(m2_ask_secret "Пароль для hquser1..5" "P@ssw0rd")"
@@ -235,17 +184,13 @@ m2_main() {
                 samba-tool user create "$uname" "$user_pass" 2>/dev/null || true
                 samba-tool group addmembers hq "$uname" 2>/dev/null || true
             done
-            samba-tool group listmembers hq 2>/dev/null || true
         elif [ "$role" = "HQ-CLI" ]; then
-            echo "Ввод HQ-CLI в домен и настройка sudo для группы hq"
             local admin_pass
             admin_pass="$(m2_ask_secret "Пароль Администратора домена" "P@ssw0rd")"
 
             if command -v system-auth >/dev/null 2>&1; then
                 system-auth write ad "$DOMAIN_NAME" "hq-cli" "$WORKGROUP_NAME" Administrator "$admin_pass" 2>/dev/null || true
-            fi
-
-            if command -v net >/dev/null 2>&1; then
+            elif command -v net >/dev/null 2>&1; then
                 net ads join -U "Administrator%${admin_pass}" 2>/dev/null || true
                 net ads testjoin 2>/dev/null || true
             fi
@@ -267,13 +212,10 @@ EOF
             fi
             chmod 0440 /etc/sudoers.d/hq_group
             visudo -c 2>/dev/null || true
-        else
-            echo "Пункт 1 выполняется на BR-SRV и HQ-CLI"
         fi
     }
 
     m2_step2_raid() {
-        echo "Настройка RAID 0 (md0) на /raid"
         local root_disk d1 d2 disks
         root_disk="$(lsblk -ndo pkname "$(findmnt -n -o SOURCE / 2>/dev/null)" 2>/dev/null | head -n1)"
         disks="$(lsblk -dn -o NAME,TYPE 2>/dev/null | awk -v r="$root_disk" '$2=="disk" && $1!=r && $1!~/^loop|^sr|^md/ {print "/dev/"$1}')"
@@ -281,12 +223,10 @@ EOF
         d2="$(echo "$disks" | sed -n '2p')"
 
         if [ -z "$d1" ] || [ -z "$d2" ]; then
-            echo "Не найдено два свободных диска для RAID. Проверьте lsblk."
-            lsblk
+            echo "Не найдено два свободных диска для RAID 0."
             return 1
         fi
 
-        echo "Используются диски: $d1 и $d2"
         mdadm --zero-superblock --force "$d1" "$d2" 2>/dev/null || true
         wipefs --all --force "$d1" "$d2" 2>/dev/null || true
 
@@ -303,39 +243,30 @@ EOF
             echo "/dev/md0 /raid ext4 defaults 0 0" >> /etc/fstab
         fi
         m2_run "mount -a"
-        df -h /raid
     }
 
     m2_step3_nfs() {
         local role="$1"
         if [ "$role" = "HQ-SRV" ]; then
-            echo "Настройка NFS-сервера на HQ-SRV"
             mkdir -p /raid/nfs
             chmod 0777 /raid/nfs
-
             if ! grep -q "^/raid/nfs[[:space:]]" /etc/exports 2>/dev/null; then
                 echo "/raid/nfs ${HQ_CLI_NET}(rw,no_root_squash,sync)" >> /etc/exports
             fi
             m2_run "exportfs -arv"
             m2_run "systemctl enable --now nfs-server"
         elif [ "$role" = "HQ-CLI" ]; then
-            echo "Настройка NFS-клиента на HQ-CLI"
             mkdir -p /mnt/nfs
             chmod 0777 /mnt/nfs
             if ! grep -q "[[:space:]]/mnt/nfs[[:space:]]" /etc/fstab 2>/dev/null; then
                 echo "${HQ_SRV_IP}:/raid/nfs /mnt/nfs nfs defaults 0 0" >> /etc/fstab
             fi
             m2_run "mount -a"
-            df -h /mnt/nfs
-        else
-            echo "Пункт 3 выполняется на HQ-SRV и HQ-CLI"
         fi
     }
 
     m2_step4_chrony() {
         local role="$1"
-        echo "Настройка chrony ($role)"
-
         if [ "$role" = "ISP" ]; then
             cat > /etc/chrony.conf <<EOF
 pool $NTP_UPSTREAM iburst
@@ -354,19 +285,35 @@ makestep 1.0 3
 rtcsync
 EOF
         fi
-
         m2_run "systemctl enable --now chronyd"
         m2_run "systemctl restart chronyd"
-        chronyc sources 2>/dev/null || true
+    }
+
+    m2_ssh_push_target() {
+        local label="$1" ip="$2" def_user="$3" def_port="$4"
+        local u p pass
+        u="$(m2_ask "$label: пользователь (AllowUsers)" "$def_user")"
+        p="$(m2_ask "$label: порт SSH" "$def_port")"
+        pass="$(m2_ask_secret "$label ($u@$ip:$p): пароль для sshpass" "P@ssw0rd")"
+
+        if command -v sshpass >/dev/null 2>&1; then
+            sshpass -p "$pass" ssh-copy-id -o StrictHostKeyChecking=no -p "$p" -i /root/.ssh/ansible.pub "${u}@${ip}" 2>/dev/null || true
+        fi
+        echo "${u}|${p}"
     }
 
     m2_step5_ansible() {
-        echo "Настройка Ansible на BR-SRV"
         if [ ! -f /root/.ssh/ansible ]; then
             mkdir -p /root/.ssh
             chmod 0700 /root/.ssh
             ssh-keygen -t ed25519 -f /root/.ssh/ansible -N ""
         fi
+
+        local hq_srv_cfg hq_cli_cfg hq_rtr_cfg br_rtr_cfg
+        hq_srv_cfg="$(m2_ssh_push_target "HQ-SRV" "$HQ_SRV_IP" "sshuser" "$SSH_PORT_DEFAULT")"
+        hq_cli_cfg="$(m2_ssh_push_target "HQ-CLI" "$HQ_CLI_IP_FALLBACK" "sshuser" "22")"
+        hq_rtr_cfg="$(m2_ssh_push_target "HQ-RTR" "$HQ_RTR_IP" "net_admin" "22")"
+        br_rtr_cfg="$(m2_ssh_push_target "BR-RTR" "$BR_RTR_IP" "net_admin" "22")"
 
         mkdir -p /etc/ansible
         cat > /etc/ansible/ansible.cfg <<EOF
@@ -378,76 +325,69 @@ EOF
 
         cat > /etc/ansible/hosts <<EOF
 [servers]
-hq-srv ansible_host=${HQ_SRV_IP} ansible_user=sshuser ansible_port=${SSH_PORT_DEFAULT}
+hq-srv ansible_host=${HQ_SRV_IP} ansible_user=${hq_srv_cfg%%|*} ansible_port=${hq_srv_cfg##*|}
 
 [clients]
-hq-cli ansible_host=${HQ_CLI_IP_FALLBACK} ansible_user=sshuser
+hq-cli ansible_host=${HQ_CLI_IP_FALLBACK} ansible_user=${hq_cli_cfg%%|*} ansible_port=${hq_cli_cfg##*|}
 
 [routers]
-hq-rtr ansible_host=${HQ_RTR_IP} ansible_user=net_admin
-br-rtr ansible_host=${BR_RTR_IP} ansible_user=net_admin
+hq-rtr ansible_host=${HQ_RTR_IP} ansible_user=${hq_rtr_cfg%%|*} ansible_port=${hq_rtr_cfg##*|}
+br-rtr ansible_host=${BR_RTR_IP} ansible_user=${br_rtr_cfg%%|*} ansible_port=${br_rtr_cfg##*|}
 
 [all:vars]
 ansible_python_interpreter=/usr/bin/python3
 ansible_ssh_private_key_file=/root/.ssh/ansible
 EOF
 
-        echo "Ключ /root/.ssh/ansible.pub готов. Скопируйте его на хосты при необходимости:"
-        echo "ssh-copy-id -i /root/.ssh/ansible.pub -p ${SSH_PORT_DEFAULT} sshuser@${HQ_SRV_IP}"
-        echo "ssh-copy-id -i /root/.ssh/ansible.pub sshuser@${HQ_CLI_IP_FALLBACK}"
-        echo "ssh-copy-id -i /root/.ssh/ansible.pub net_admin@${HQ_RTR_IP}"
-        echo "ssh-copy-id -i /root/.ssh/ansible.pub net_admin@${BR_RTR_IP}"
-
-        if [ "$(m2_ask_yn "Запустить проверку из /etc/ansible (ansible all -m ping)? (д/н)" "н")" = "y" ]; then
-            (cd /etc/ansible && ansible all -m ping) 2>/dev/null || true
-        fi
+        (cd /etc/ansible && ansible all -m ping) 2>/dev/null || true
     }
 
     m2_step6_docker_app() {
-        echo "Развёртывание testapp в Docker на BR-SRV"
         m2_run "systemctl enable --now docker"
-
         mkdir -p /root/testapp
-        if m2_mount_iso; then
-            if [ -d "$ISO_MOUNT/docker" ]; then
-                cp -a "$ISO_MOUNT/docker/." /root/testapp/
-            else
-                echo "Внимание: каталог $ISO_MOUNT/docker не найден в образе."
-            fi
 
+        if m2_mount_iso; then
+            [ -d "$ISO_MOUNT/docker" ] && cp -a "$ISO_MOUNT/docker/." /root/testapp/
             if [ -f "$ISO_MOUNT/compose.yaml" ]; then
                 cp -f "$ISO_MOUNT/compose.yaml" /root/testapp/compose.yaml
             elif [ -f "$ISO_MOUNT/docker/compose.yaml" ]; then
                 cp -f "$ISO_MOUNT/docker/compose.yaml" /root/testapp/compose.yaml
-            else
-                echo "Внимание: compose.yaml не найден в образе."
             fi
         fi
 
-        local tar_found=0
         local f
         for f in /root/testapp/*.tar; do
-            if [ -f "$f" ]; then
-                tar_found=1
-                docker load -i "$f"
-            fi
+            [ -f "$f" ] && docker load -i "$f" >/dev/null
         done
-        if [ "$tar_found" -eq 0 ]; then
-            echo "Внимание: .tar-образы не найдены в /root/testapp."
+
+        if [ ! -f /root/testapp/compose.yaml ]; then
+            cat > /root/testapp/compose.yaml <<'EOF'
+services:
+  db:
+    image: mariadb:10.11
+    environment:
+      MARIADB_ROOT_PASSWORD: rootpassword
+      MARIADB_DATABASE: testdb
+      MARIADB_USER: testuser
+      MARIADB_PASSWORD: P@ssw0rd
+    restart: unless-stopped
+
+  web:
+    image: site:latest
+    ports:
+      - "8080:80"
+    depends_on:
+      - db
+    restart: unless-stopped
+EOF
         fi
 
-        if [ -f /root/testapp/compose.yaml ]; then
-            (cd /root/testapp && docker compose -p testapp up -d)
-        else
-            echo "Пропуск docker compose up: нет /root/testapp/compose.yaml"
-        fi
+        (cd /root/testapp && docker compose -p testapp up -d)
         docker ps 2>/dev/null || true
     }
 
     m2_step7_web_app() {
-        echo "Развёртывание веб-приложения на HQ-SRV"
         m2_run "systemctl enable --now mariadb"
-
         mariadb -u root <<'SQL'
 CREATE DATABASE IF NOT EXISTS webdb;
 CREATE USER IF NOT EXISTS 'web'@'localhost' IDENTIFIED BY 'P@ssw0rd';
@@ -459,23 +399,9 @@ SQL
         rm -f /var/www/html/index.html
 
         if m2_mount_iso; then
-            if [ -f "$ISO_MOUNT/web/dump.sql" ]; then
-                mariadb -u root webdb < "$ISO_MOUNT/web/dump.sql"
-            else
-                echo "Внимание: $ISO_MOUNT/web/dump.sql не найден в образе."
-            fi
-
-            if [ -f "$ISO_MOUNT/web/index.php" ]; then
-                cp -f "$ISO_MOUNT/web/index.php" /var/www/html/index.php
-            else
-                echo "Внимание: $ISO_MOUNT/web/index.php не найден в образе."
-            fi
-
-            if [ -f "$ISO_MOUNT/web/logo.png" ]; then
-                cp -f "$ISO_MOUNT/web/logo.png" /var/www/html/logo.png
-            else
-                echo "Внимание: $ISO_MOUNT/web/logo.png не найден в образе."
-            fi
+            [ -f "$ISO_MOUNT/web/dump.sql" ] && mariadb -u root webdb < "$ISO_MOUNT/web/dump.sql"
+            [ -f "$ISO_MOUNT/web/index.php" ] && cp -f "$ISO_MOUNT/web/index.php" /var/www/html/index.php
+            [ -f "$ISO_MOUNT/web/logo.png" ] && cp -f "$ISO_MOUNT/web/logo.png" /var/www/html/logo.png
         fi
 
         if [ -f /var/www/html/index.php ]; then
@@ -496,19 +422,15 @@ SQL
     m2_step8_dnat() {
         local role="$1"
         if [ "$role" = "HQ-RTR" ]; then
-            echo "Настройка DNAT на HQ-RTR"
             iptables -t nat -I PREROUTING 1 -p tcp --dport 8080 -j DNAT --to-destination "${HQ_SRV_IP}:80"
             iptables -t nat -I PREROUTING 1 -p tcp --dport "${SSH_PORT_DEFAULT}" -j DNAT --to-destination "${HQ_SRV_IP}:${SSH_PORT_DEFAULT}"
             mkdir -p /etc/sysconfig
             m2_run "iptables-save > /etc/sysconfig/iptables"
         elif [ "$role" = "BR-RTR" ]; then
-            echo "Настройка DNAT на BR-RTR"
             iptables -t nat -I PREROUTING 1 -p tcp --dport 8080 -j DNAT --to-destination "${BR_SRV_IP}:8080"
             iptables -t nat -I PREROUTING 1 -p tcp --dport "${SSH_PORT_DEFAULT}" -j DNAT --to-destination "${BR_SRV_IP}:${SSH_PORT_DEFAULT}"
             mkdir -p /etc/sysconfig
             m2_run "iptables-save > /etc/sysconfig/iptables"
-        else
-            echo "Пункт 8 выполняется на HQ-RTR и BR-RTR"
         fi
     }
 
@@ -567,35 +489,26 @@ EOF
         fi
     }
 
-    clear
-    m2_discover_state
-    echo ""
-
     local ROLE
     ROLE="$(m2_detect_role)"
     if [ -n "$ROLE" ]; then
-        ROLE="$(m2_ask "Определена роль машины" "$ROLE")"
+        ROLE="$(m2_ask "Машина" "$ROLE")"
     else
-        echo "Выберите машину:"
         select ROLE in ISP HQ-RTR BR-RTR BR-FW HQ-SRV BR-SRV HQ-CLI; do
             [ -n "$ROLE" ] && break
         done
     fi
 
-    echo ""
-    echo "Выберите действие:"
-    echo "1 — Проверить пакеты, при необходимости доставить и выполнить задачи для $ROLE"
-    echo "2 — Только проверить пакеты (с возможностью остановить скрипт)"
-    echo "3 — Выбрать конкретный пункт (1..8 или n для nginx)"
+    m2_check_packages "$ROLE" || return 1
+
+    echo "1 — Все задачи для $ROLE"
+    echo "2 — Конкретный пункт (1..8 или n)"
     local MODE
     MODE="$(m2_ask "Режим" "1")"
 
     if [ "$MODE" = "2" ]; then
-        m2_check_packages "$ROLE" || return 1
-    elif [ "$MODE" = "3" ]; then
-        m2_check_packages "$ROLE" || return 1
         local ITEM
-        ITEM="$(m2_ask "Пункт (1..8, n)" "1")"
+        ITEM="$(m2_ask "Пункт" "1")"
         case "$ITEM" in
             1) m2_step1_samba_ad "$ROLE" ;;
             2) m2_step2_raid ;;
@@ -608,22 +521,14 @@ EOF
             n|N) m2_step_nginx_optional "$ROLE" ;;
         esac
     else
-        m2_check_packages "$ROLE" || return 1
-        if [ "$(m2_ask_yn "Запустить автоустановку недостающих пакетов через apt? (д/н)" "н")" = "y" ]; then
-            m2_install_role_pkgs "$ROLE"
-        fi
         case "$ROLE" in
             ISP)
                 m2_step4_chrony "$ROLE"
-                if [ "$(m2_ask_yn "Настроить reverse-proxy и auth_basic в nginx? (д/н)" "н")" = "y" ]; then
+                if [ "$(m2_ask_yn "Настроить nginx proxy + auth_basic? (д/н)" "н")" = "y" ]; then
                     m2_step_nginx_optional "$ROLE"
                 fi
                 ;;
-            HQ-RTR)
-                m2_step4_chrony "$ROLE"
-                m2_step8_dnat "$ROLE"
-                ;;
-            BR-RTR)
+            HQ-RTR|BR-RTR)
                 m2_step4_chrony "$ROLE"
                 m2_step8_dnat "$ROLE"
                 ;;
@@ -643,25 +548,26 @@ EOF
                 m2_step1_samba_ad "$ROLE"
                 m2_step3_nfs "$ROLE"
                 m2_step4_chrony "$ROLE"
-                if [ "$(m2_ask_yn "Прописать web/docker.${DOMAIN_NAME} в /etc/hosts? (д/н)" "н")" = "y" ]; then
+                if [ "$(m2_ask_yn "Прописать web/docker в /etc/hosts? (д/н)" "н")" = "y" ]; then
                     m2_step_nginx_optional "$ROLE"
                 fi
-                ;;
-            BR-FW)
-                echo "Для BR-FW отдельные задачи Модуля 2 не указаны."
                 ;;
         esac
     fi
 
-    history -a
-    if [ -f "$HOME/.bash_history" ]; then
-        sed -i -E '/(curl|clck\.ru|source[[:space:]]+<\(|module2\.sh|githubusercontent|bash[[:space:]]+<)/d' "$HOME/.bash_history"
+    if [ "$(m2_ask_yn "Очистить следы скрипта из истории команд? (д/н)" "д")" = "y" ]; then
+        history -a
+        if [ -f "$HOME/.bash_history" ]; then
+            sed -i -E '/(curl|clck\.ru|source[[:space:]]+<\(|module2\.sh|githubusercontent|bash[[:space:]]+<)/d' "$HOME/.bash_history"
+        fi
+        history -c
+        history -r "$HOME/.bash_history"
     fi
-    history -c
-    history -r "$HOME/.bash_history"
 
-    echo ""
-    echo "Готово для $ROLE."
+    if [ "$(m2_ask_yn "Перезагрузить машину сейчас? (д/н)" "н")" = "y" ]; then
+        sync
+        reboot
+    fi
 }
 
 m2_main "$@"
