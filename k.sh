@@ -27,6 +27,7 @@ m2_main() {
     local BR_SRV_IP="192.168.0.2"
     local HQ_CLI_NET="192.168.200.0/28"
     local HQ_CLI_IP_FALLBACK="192.168.200.2"
+    local ISP_NTP_DEFAULT="172.16.1.1"
 
     m2_hist() {
         history -s "$1" 2>/dev/null || true
@@ -305,24 +306,55 @@ EOF
     }
 
     m2_step2_raid() {
-        local root_disk d1 d2 disks
+        local root_disk disks
         root_disk="$(lsblk -ndo pkname "$(findmnt -n -o SOURCE / 2>/dev/null)" 2>/dev/null | head -n1)"
         disks="$(lsblk -dn -o NAME,TYPE 2>/dev/null | awk -v r="$root_disk" '$2=="disk" && $1!=r && $1!~/^loop|^sr|^md/ {print "/dev/"$1}')"
-        d1="$(echo "$disks" | sed -n '1p')"
-        d2="$(echo "$disks" | sed -n '2p')"
 
-        if [ -z "$d1" ] || [ -z "$d2" ]; then
-            echo "Не найдено два свободных диска для RAID 0."
+        echo "Доступные свободные диски:"
+        echo "${disks:-  (не найдено)}"
+
+        local raid_level min_disks dev_count chosen_disks d
+        raid_level="$(m2_ask "Уровень RAID (0, 1, 3, 4, 5, 6, 10)" "0")"
+
+        case "$raid_level" in
+            0|1|3) min_disks=2 ;;
+            4|5)   min_disks=3 ;;
+            6|10)  min_disks=4 ;;
+            *)
+                echo "Неподдерживаемый уровень RAID: $raid_level"
+                return 1
+                ;;
+        esac
+
+        local avail_count
+        avail_count="$(echo "$disks" | sed '/^$/d' | wc -l)"
+        if [ "$avail_count" -lt "$min_disks" ]; then
+            echo "Для RAID $raid_level нужно минимум $min_disks свободных дисков, найдено: $avail_count."
             return 1
         fi
 
-        mdadm --zero-superblock --force "$d1" "$d2" 2>/dev/null || true
-        m2_hist "mdadm --zero-superblock --force $d1 $d2"
-        wipefs --all --force "$d1" "$d2" 2>/dev/null || true
-        m2_hist "wipefs --all --force $d1 $d2"
+        local def_count="$min_disks"
+        if [ "$raid_level" = "0" ] && [ "$avail_count" -ge 2 ]; then
+            def_count=2
+        fi
+        dev_count="$(m2_ask "Сколько дисков включить в RAID $raid_level" "$def_count")"
+
+        chosen_disks="$(echo "$disks" | sed '/^$/d' | head -n "$dev_count" | tr '\n' ' ')"
+        if [ -z "$chosen_disks" ]; then
+            echo "Не удалось выбрать диски для RAID."
+            return 1
+        fi
+
+        echo "Создаётся RAID $raid_level (/dev/md0) на дисках: $chosen_disks"
+        for d in $chosen_disks; do
+            mdadm --zero-superblock --force "$d" 2>/dev/null || true
+            m2_hist "mdadm --zero-superblock --force $d"
+            wipefs --all --force "$d" 2>/dev/null || true
+            m2_hist "wipefs --all --force $d"
+        done
 
         if [ ! -e /dev/md0 ]; then
-            m2_run "mdadm --create /dev/md0 --level=0 --raid-devices=2 $d1 $d2 --run"
+            m2_run "mdadm --create /dev/md0 --level=${raid_level} --raid-devices=${dev_count} ${chosen_disks} --run"
         fi
 
         mkfs -t ext4 -F /dev/md0 2>/dev/null || true
@@ -338,6 +370,7 @@ EOF
         fi
         m2_run "mount -a"
         m2_hist "df -h /raid"
+        cat /proc/mdstat 2>/dev/null || true
     }
 
     m2_step3_nfs() {
@@ -378,8 +411,10 @@ allow 0/0
 local stratum 5
 EOF
         else
+            local ntp_srv
+            ntp_srv="$(m2_ask "IP сервера времени (ISP)" "$ISP_NTP_DEFAULT")"
             cat > /etc/chrony.conf <<EOF
-server ${HQ_RTR_IP} iburst prefer
+server ${ntp_srv} iburst prefer
 driftfile /var/lib/chrony/drift
 makestep 1.0 3
 rtcsync
@@ -696,7 +731,7 @@ EOF
             m2_run "systemctl restart nginx"
         elif [ "$role" = "HQ-CLI" ]; then
             local isp_ip
-            isp_ip="$(m2_ask "IP адрес ISP для /etc/hosts" "172.16.1.1")"
+            isp_ip="$(m2_ask "IP адрес ISP для /etc/hosts" "$ISP_NTP_DEFAULT")"
             if ! grep -q "web.${DOMAIN_NAME}" /etc/hosts 2>/dev/null; then
                 echo "${isp_ip} web.${DOMAIN_NAME} docker.${DOMAIN_NAME}" >> /etc/hosts
                 m2_hist "nano /etc/hosts"
@@ -719,7 +754,7 @@ EOF
                 echo "  s — Подготовить SSH и пользователя для Ansible на этом узле"
                 ;;
             HQ-SRV)
-                echo "  2 — RAID 0 (/dev/md0 -> /raid)"
+                echo "  2 — RAID (выбор уровня 0/1/3/4/5/6/10 и дисков -> /raid)"
                 echo "  3 — NFS сервер (/raid/nfs)"
                 echo "  4 — Chrony (клиент времени)"
                 echo "  7 — Веб-приложение (Apache + MariaDB)"
