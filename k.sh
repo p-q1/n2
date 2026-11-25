@@ -82,22 +82,22 @@ m2_main() {
         local role="$1"
         case "$role" in
             ISP)
-                echo "chrony nginx openssl iptables"
+                echo "chrony nginx openssl iptables openssh-server"
                 ;;
             HQ-RTR|BR-RTR)
-                echo "chrony iptables"
+                echo "chrony iptables openssh-server"
                 ;;
             HQ-SRV)
-                echo "chrony mdadm nfs-server nfs-utils rpcbind apache2 apache2-mod_php8.3 php8.3-mysqlnd-mysqli mariadb-server"
+                echo "chrony mdadm nfs-server nfs-utils rpcbind apache2 apache2-mod_php8.3 php8.3-mysqlnd-mysqli mariadb-server openssh-server"
                 ;;
             BR-SRV)
-                echo "chrony sshpass ansible docker-engine docker-compose-v2 task-samba-dc"
+                echo "chrony sshpass ansible docker-engine docker-compose-v2 task-samba-dc openssh-server"
                 ;;
             HQ-CLI)
-                echo "chrony nfs-utils nfs-clients rpcbind task-auth-ad-sssd"
+                echo "chrony nfs-utils nfs-clients rpcbind task-auth-ad-sssd openssh-server"
                 ;;
             *)
-                echo "chrony"
+                echo "chrony openssh-server"
                 ;;
         esac
     }
@@ -152,6 +152,66 @@ m2_main() {
             fi
         done
         return 1
+    }
+
+    m2_ensure_ssh_ready() {
+        local role="$1"
+        local def_user="sshuser"
+        case "$role" in
+            HQ-RTR|BR-RTR) def_user="net_admin" ;;
+        esac
+
+        local ssh_user ssh_pass ssh_port
+        ssh_user="$(m2_ask "Локальный SSH-пользователь для этого узла" "$def_user")"
+        ssh_port="$(m2_ask "Порт SSH для этого узла" "$SSH_PORT_DEFAULT")"
+
+        if ! id "$ssh_user" >/dev/null 2>&1; then
+            useradd -m -s /bin/bash "$ssh_user" 2>/dev/null || true
+            m2_hist "useradd -m -s /bin/bash $ssh_user"
+        fi
+
+        if [ "$(m2_ask_yn "Задать/обновить пароль для $ssh_user? (д/н)" "д")" = "y" ]; then
+            ssh_pass="$(m2_ask_secret "Пароль для $ssh_user" "P@ssw0rd")"
+            echo "${ssh_user}:${ssh_pass}" | chpasswd
+            m2_hist "passwd $ssh_user"
+        fi
+
+        mkdir -p "/home/${ssh_user}/.ssh"
+        chmod 0700 "/home/${ssh_user}/.ssh"
+        touch "/home/${ssh_user}/.ssh/authorized_keys"
+        chmod 0600 "/home/${ssh_user}/.ssh/authorized_keys"
+        chown -R "${ssh_user}:${ssh_user}" "/home/${ssh_user}/.ssh"
+
+        cat > "/etc/sudoers.d/90-ansible-${ssh_user}" <<EOF
+${ssh_user} ALL=(ALL) NOPASSWD: ALL
+EOF
+        chmod 0440 "/etc/sudoers.d/90-ansible-${ssh_user}"
+        visudo -c >/dev/null 2>&1 && m2_hist "visudo -c" || true
+
+        if [ -f /etc/ssh/sshd_config ]; then
+            sed -i -E "s/^#?Port[[:space:]]+.*/Port ${ssh_port}/" /etc/ssh/sshd_config
+            if ! grep -qE "^Port[[:space:]]+${ssh_port}" /etc/ssh/sshd_config; then
+                echo "Port ${ssh_port}" >> /etc/ssh/sshd_config
+            fi
+            if grep -qE "^#?AllowUsers[[:space:]]+" /etc/ssh/sshd_config; then
+                if ! grep -qE "^#?AllowUsers[[:space:]]+.*\b${ssh_user}\b" /etc/ssh/sshd_config; then
+                    sed -i -E "s/^(#?AllowUsers[[:space:]]+.*)/\1 ${ssh_user}/" /etc/ssh/sshd_config
+                fi
+            else
+                echo "AllowUsers ${ssh_user} root" >> /etc/ssh/sshd_config
+            fi
+            m2_hist "nano /etc/ssh/sshd_config"
+        fi
+
+        if systemctl list-unit-files 2>/dev/null | grep -q '^sshd\.service'; then
+            m2_run "systemctl enable --now sshd"
+            m2_run "systemctl restart sshd"
+        else
+            m2_run "systemctl enable --now ssh"
+            m2_run "systemctl restart ssh"
+        fi
+
+        echo "SSH готов на $role: пользователь=$ssh_user, порт=$ssh_port, sudo NOPASSWD включён."
     }
 
     m2_step1_samba_ad() {
@@ -331,18 +391,69 @@ EOF
         m2_hist "chronyc sources"
     }
 
+    m2_check_ssh_and_ansible_host() {
+        local host_alias="$1" ip="$2" u="$3" p="$4" pass="$5"
+        local ping_ok="НЕТ" tcp_ok="НЕТ" copy_ok="НЕТ" ansible_ok="НЕТ"
+
+        echo "--- Проверка $host_alias ($u@$ip:$p) ---"
+        if ping -c 1 -W 2 "$ip" >/dev/null 2>&1; then
+            ping_ok="ОК"
+            echo "  [1] Пинг до $ip: ОК"
+        else
+            echo "  [1] Пинг до $ip: ОШИБКА (хост не отвечает на ping)"
+        fi
+
+        if timeout 3 bash -c "</dev/tcp/${ip}/${p}" 2>/dev/null; then
+            tcp_ok="ОК"
+            echo "  [2] Порт SSH $p на $ip: ОТКРЫТ"
+        else
+            echo "  [2] Порт SSH $p на $ip: ЗАКРЫТ / НЕДОСТУПЕН"
+        fi
+
+        if [ "$tcp_ok" = "ОК" ]; then
+            if command -v sshpass >/dev/null 2>&1; then
+                if sshpass -p "$pass" ssh-copy-id -o StrictHostKeyChecking=no -o ConnectTimeout=5 -p "$p" -i /root/.ssh/ansible.pub "${u}@${ip}" >/dev/null 2>&1; then
+                    copy_ok="ОК"
+                    m2_hist "ssh-copy-id -i /root/.ssh/ansible.pub -p $p ${u}@${ip}"
+                    echo "  [3] Копирование ключа и вход по SSH: ОК"
+                else
+                    echo "  [3] Копирование ключа и вход по SSH: ОШИБКА (проверьте пользователя AllowUsers, пароль или доступ root/sudo)"
+                fi
+            else
+                echo "  [3] Копирование ключа: пропущено (нет sshpass)"
+            fi
+        else
+            echo "  [3] Копирование ключа: пропущено (нет TCP-соединения с $ip:$p)"
+        fi
+
+        if [ "$copy_ok" = "ОК" ] && [ -f /etc/ansible/hosts ]; then
+            if (cd /etc/ansible && ansible "$host_alias" -m ping >/dev/null 2>&1); then
+                ansible_ok="ОК"
+                echo "  [4] Пригодность для Ansible ($host_alias): ГОТОВ"
+            else
+                echo "  [4] Пригодность для Ansible ($host_alias): НЕ ГОТОВ (проверьте python3 и права sudo на удалённом узле)"
+            fi
+        else
+            echo "  [4] Пригодность для Ansible ($host_alias): НЕ ГОТОВ"
+        fi
+
+        echo "  Итог [$host_alias]: ping=$ping_ok | ssh_tcp=$tcp_ok | key_auth=$copy_ok | ansible=$ansible_ok"
+    }
+
     m2_ssh_push_target() {
-        local label="$1" def_ip="$2" def_user="$3" def_port="$4"
+        local alias_name="$1" label="$2" def_ip="$3" def_user="$4" def_port="$5"
         local ip u p pass
         ip="$(m2_ask "$label: IP-адрес" "$def_ip")"
         u="$(m2_ask "$label: пользователь (AllowUsers)" "$def_user")"
         p="$(m2_ask "$label: порт SSH" "$def_port")"
         pass="$(m2_ask_secret "$label ($u@$ip:$p): пароль для sshpass" "P@ssw0rd")"
 
-        if command -v sshpass >/dev/null 2>&1; then
-            sshpass -p "$pass" ssh-copy-id -o StrictHostKeyChecking=no -p "$p" -i /root/.ssh/ansible.pub "${u}@${ip}" 2>/dev/null || true
-            m2_hist "ssh-copy-id -i /root/.ssh/ansible.pub -p $p ${u}@${ip}"
+        if [ -f /etc/ansible/hosts ]; then
+            sed -i "/^[[:space:]]*${alias_name}[[:space:]]/d" /etc/ansible/hosts
+            echo "${alias_name} ansible_host=${ip} ansible_user=${u} ansible_port=${p}" >> /etc/ansible/hosts
         fi
+
+        m2_check_ssh_and_ansible_host "$alias_name" "$ip" "$u" "$p" "$pass"
         echo "${ip}|${u}|${p}"
     }
 
@@ -354,22 +465,6 @@ EOF
             m2_hist "ssh-keygen -t ed25519 -f /root/.ssh/ansible -N \"\""
         fi
 
-        local hq_srv_cfg hq_cli_cfg hq_rtr_cfg br_rtr_cfg
-        local hq_srv_ip hq_srv_u hq_srv_p
-        local hq_cli_ip hq_cli_u hq_cli_p
-        local hq_rtr_ip hq_rtr_u hq_rtr_p
-        local br_rtr_ip br_rtr_u br_rtr_p
-
-        hq_srv_cfg="$(m2_ssh_push_target "HQ-SRV" "$HQ_SRV_IP" "sshuser" "$SSH_PORT_DEFAULT")"
-        hq_cli_cfg="$(m2_ssh_push_target "HQ-CLI" "$HQ_CLI_IP_FALLBACK" "sshuser" "22")"
-        hq_rtr_cfg="$(m2_ssh_push_target "HQ-RTR" "$HQ_RTR_IP" "net_admin" "22")"
-        br_rtr_cfg="$(m2_ssh_push_target "BR-RTR" "$BR_RTR_IP" "net_admin" "22")"
-
-        IFS='|' read -r hq_srv_ip hq_srv_u hq_srv_p <<< "$hq_srv_cfg"
-        IFS='|' read -r hq_cli_ip hq_cli_u hq_cli_p <<< "$hq_cli_cfg"
-        IFS='|' read -r hq_rtr_ip hq_rtr_u hq_rtr_p <<< "$hq_rtr_cfg"
-        IFS='|' read -r br_rtr_ip br_rtr_u br_rtr_p <<< "$br_rtr_cfg"
-
         mkdir -p /etc/ansible
         cat > /etc/ansible/ansible.cfg <<EOF
 [defaults]
@@ -378,6 +473,38 @@ host_key_checking = False
 interpreter_python = /usr/bin/python3
 EOF
         m2_hist "nano /etc/ansible/ansible.cfg"
+
+        cat > /etc/ansible/hosts <<EOF
+[servers]
+hq-srv ansible_host=${HQ_SRV_IP} ansible_user=sshuser ansible_port=${SSH_PORT_DEFAULT}
+
+[clients]
+hq-cli ansible_host=${HQ_CLI_IP_FALLBACK} ansible_user=sshuser ansible_port=22
+
+[routers]
+hq-rtr ansible_host=${HQ_RTR_IP} ansible_user=net_admin ansible_port=22
+br-rtr ansible_host=${BR_RTR_IP} ansible_user=net_admin ansible_port=22
+
+[all:vars]
+ansible_python_interpreter=/usr/bin/python3
+ansible_ssh_private_key_file=/root/.ssh/ansible
+EOF
+
+        local hq_srv_cfg hq_cli_cfg hq_rtr_cfg br_rtr_cfg
+        local hq_srv_ip hq_srv_u hq_srv_p
+        local hq_cli_ip hq_cli_u hq_cli_p
+        local hq_rtr_ip hq_rtr_u hq_rtr_p
+        local br_rtr_ip br_rtr_u br_rtr_p
+
+        hq_srv_cfg="$(m2_ssh_push_target "hq-srv" "HQ-SRV" "$HQ_SRV_IP" "sshuser" "$SSH_PORT_DEFAULT")"
+        hq_cli_cfg="$(m2_ssh_push_target "hq-cli" "HQ-CLI" "$HQ_CLI_IP_FALLBACK" "sshuser" "22")"
+        hq_rtr_cfg="$(m2_ssh_push_target "hq-rtr" "HQ-RTR" "$HQ_RTR_IP" "net_admin" "22")"
+        br_rtr_cfg="$(m2_ssh_push_target "br-rtr" "BR-RTR" "$BR_RTR_IP" "net_admin" "22")"
+
+        IFS='|' read -r hq_srv_ip hq_srv_u hq_srv_p <<< "$hq_srv_cfg"
+        IFS='|' read -r hq_cli_ip hq_cli_u hq_cli_p <<< "$hq_cli_cfg"
+        IFS='|' read -r hq_rtr_ip hq_rtr_u hq_rtr_p <<< "$hq_rtr_cfg"
+        IFS='|' read -r br_rtr_ip br_rtr_u br_rtr_p <<< "$br_rtr_cfg"
 
         cat > /etc/ansible/hosts <<EOF
 [servers]
@@ -396,7 +523,8 @@ ansible_ssh_private_key_file=/root/.ssh/ansible
 EOF
         m2_hist "nano /etc/ansible/hosts"
 
-        (cd /etc/ansible && ansible all -m ping) 2>/dev/null || true
+        echo "=== Итоговая проверка всех хостов Ansible ==="
+        (cd /etc/ansible && ansible all -m ping) || true
         m2_hist "cd /etc/ansible && ansible all -m ping"
     }
 
@@ -576,6 +704,63 @@ EOF
         fi
     }
 
+    m2_print_role_mini_menu() {
+        local role="$1"
+        echo "Пункты для $role:"
+        case "$role" in
+            ISP)
+                echo "  4 — Chrony (сервер времени)"
+                echo "  s — Подготовить SSH и пользователя для Ansible на этом узле"
+                echo "  n — Nginx reverse-proxy + auth_basic"
+                ;;
+            HQ-RTR|BR-RTR)
+                echo "  4 — Chrony (клиент времени)"
+                echo "  8 — DNAT (проброс 8080 и SSH)"
+                echo "  s — Подготовить SSH и пользователя для Ansible на этом узле"
+                ;;
+            HQ-SRV)
+                echo "  2 — RAID 0 (/dev/md0 -> /raid)"
+                echo "  3 — NFS сервер (/raid/nfs)"
+                echo "  4 — Chrony (клиент времени)"
+                echo "  7 — Веб-приложение (Apache + MariaDB)"
+                echo "  s — Подготовить SSH и пользователя для Ansible на этом узле"
+                ;;
+            BR-SRV)
+                echo "  1 — Samba DC, политика паролей, группа hq и hquser1..5"
+                echo "  4 — Chrony (клиент времени)"
+                echo "  5 — SSH-ключи, проверка связи и Ansible (/etc/ansible)"
+                echo "  6 — Docker (testapp)"
+                ;;
+            HQ-CLI)
+                echo "  s — Подготовить SSH и пользователя (до ввода в домен, без конфликта)"
+                echo "  1 — Ввод в домен и sudo для группы hq"
+                echo "  3 — NFS клиент (/mnt/nfs)"
+                echo "  4 — Chrony (клиент времени)"
+                echo "  h — Прописать web/docker.${DOMAIN_NAME} в /etc/hosts"
+                ;;
+            *)
+                echo "  s — Подготовить SSH и пользователя для Ansible на этом узле"
+                ;;
+        esac
+    }
+
+    m2_run_role_item() {
+        local role="$1" item="$2"
+        case "$item" in
+            s|S) m2_ensure_ssh_ready "$role" ;;
+            1)   m2_step1_samba_ad "$role" ;;
+            2)   m2_step2_raid ;;
+            3)   m2_step3_nfs "$role" ;;
+            4)   m2_step4_chrony "$role" ;;
+            5)   m2_step5_ansible ;;
+            6)   m2_step6_docker_app ;;
+            7)   m2_step7_web_app ;;
+            8)   m2_step8_dnat "$role" ;;
+            n|N|h|H) m2_step_nginx_optional "$role" ;;
+            *)   echo "Неизвестный пункт: $item" ;;
+        esac
+    }
+
     local ROLE
     ROLE="$(m2_detect_role)"
     if [ -n "$ROLE" ]; then
@@ -589,37 +774,31 @@ EOF
     m2_ensure_packages "$ROLE"
 
     echo "1 — Все задачи для $ROLE"
-    echo "2 — Конкретный пункт (1..8 или n)"
+    echo "2 — Конкретный пункт (мини-список для $ROLE)"
     local MODE
     MODE="$(m2_ask "Режим" "1")"
 
     if [ "$MODE" = "2" ]; then
+        m2_print_role_mini_menu "$ROLE"
         local ITEM
-        ITEM="$(m2_ask "Пункт" "1")"
-        case "$ITEM" in
-            1) m2_step1_samba_ad "$ROLE" ;;
-            2) m2_step2_raid ;;
-            3) m2_step3_nfs "$ROLE" ;;
-            4) m2_step4_chrony "$ROLE" ;;
-            5) m2_step5_ansible ;;
-            6) m2_step6_docker_app ;;
-            7) m2_step7_web_app ;;
-            8) m2_step8_dnat "$ROLE" ;;
-            n|N) m2_step_nginx_optional "$ROLE" ;;
-        esac
+        ITEM="$(m2_ask "Выберите пункт" "1")"
+        m2_run_role_item "$ROLE" "$ITEM"
     else
         case "$ROLE" in
             ISP)
+                m2_ensure_ssh_ready "$ROLE"
                 m2_step4_chrony "$ROLE"
                 if [ "$(m2_ask_yn "Настроить nginx proxy + auth_basic? (д/н)" "н")" = "y" ]; then
                     m2_step_nginx_optional "$ROLE"
                 fi
                 ;;
             HQ-RTR|BR-RTR)
+                m2_ensure_ssh_ready "$ROLE"
                 m2_step4_chrony "$ROLE"
                 m2_step8_dnat "$ROLE"
                 ;;
             HQ-SRV)
+                m2_ensure_ssh_ready "$ROLE"
                 m2_step2_raid
                 m2_step3_nfs "$ROLE"
                 m2_step4_chrony "$ROLE"
@@ -632,6 +811,7 @@ EOF
                 m2_step6_docker_app
                 ;;
             HQ-CLI)
+                m2_ensure_ssh_ready "$ROLE"
                 m2_step1_samba_ad "$ROLE"
                 m2_step3_nfs "$ROLE"
                 m2_step4_chrony "$ROLE"
