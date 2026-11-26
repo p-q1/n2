@@ -140,6 +140,51 @@ m2_main() {
         fi
     }
 
+    m2_fast_ssh_only() {
+        local role="$1"
+        local def_user="sshuser"
+        case "$role" in
+            HQ-RTR|BR-RTR) def_user="net_admin" ;;
+        esac
+
+        if ! id "$def_user" >/dev/null 2>&1; then
+            useradd -m -s /bin/bash "$def_user" 2>/dev/null || true
+            echo "${def_user}:P@ssw0rd" | chpasswd 2>/dev/null || true
+            m2_hist "useradd -m -s /bin/bash $def_user"
+        fi
+
+        mkdir -p "/home/${def_user}/.ssh"
+        chmod 0700 "/home/${def_user}/.ssh"
+        touch "/home/${def_user}/.ssh/authorized_keys"
+        chmod 0600 "/home/${def_user}/.ssh/authorized_keys"
+        chown -R "${def_user}:${def_user}" "/home/${def_user}/.ssh"
+
+        cat > "/etc/sudoers.d/90-ansible-${def_user}" <<EOF
+${def_user} ALL=(ALL) NOPASSWD: ALL
+EOF
+        chmod 0440 "/etc/sudoers.d/90-ansible-${def_user}"
+
+        if [ -f /etc/ssh/sshd_config ]; then
+            if grep -qE "^#?AllowUsers[[:space:]]+" /etc/ssh/sshd_config; then
+                if ! grep -qE "^#?AllowUsers[[:space:]]+.*\b${def_user}\b" /etc/ssh/sshd_config; then
+                    sed -i -E "s/^(#?AllowUsers[[:space:]]+.*)/\1 ${def_user}/" /etc/ssh/sshd_config
+                fi
+            else
+                echo "AllowUsers ${def_user} root" >> /etc/ssh/sshd_config
+            fi
+        fi
+
+        if systemctl list-unit-files 2>/dev/null | grep -q '^sshd\.service'; then
+            systemctl enable --now sshd 2>/dev/null || true
+            systemctl restart sshd 2>/dev/null || true
+        else
+            systemctl enable --now ssh 2>/dev/null || true
+            systemctl restart ssh 2>/dev/null || true
+        fi
+
+        echo "[$role] Пакеты проверены, SSH активен, пользователь $def_user готов."
+    }
+
     m2_mount_iso() {
         mkdir -p "$ISO_MOUNT"
         if mountpoint -q "$ISO_MOUNT" 2>/dev/null; then
@@ -153,66 +198,6 @@ m2_main() {
             fi
         done
         return 1
-    }
-
-    m2_ensure_ssh_ready() {
-        local role="$1"
-        local def_user="sshuser"
-        case "$role" in
-            HQ-RTR|BR-RTR) def_user="net_admin" ;;
-        esac
-
-        local ssh_user ssh_pass ssh_port
-        ssh_user="$(m2_ask "Локальный SSH-пользователь для этого узла" "$def_user")"
-        ssh_port="$(m2_ask "Порт SSH для этого узла" "$SSH_PORT_DEFAULT")"
-
-        if ! id "$ssh_user" >/dev/null 2>&1; then
-            useradd -m -s /bin/bash "$ssh_user" 2>/dev/null || true
-            m2_hist "useradd -m -s /bin/bash $ssh_user"
-        fi
-
-        if [ "$(m2_ask_yn "Задать/обновить пароль для $ssh_user? (д/н)" "д")" = "y" ]; then
-            ssh_pass="$(m2_ask_secret "Пароль для $ssh_user" "P@ssw0rd")"
-            echo "${ssh_user}:${ssh_pass}" | chpasswd
-            m2_hist "passwd $ssh_user"
-        fi
-
-        mkdir -p "/home/${ssh_user}/.ssh"
-        chmod 0700 "/home/${ssh_user}/.ssh"
-        touch "/home/${ssh_user}/.ssh/authorized_keys"
-        chmod 0600 "/home/${ssh_user}/.ssh/authorized_keys"
-        chown -R "${ssh_user}:${ssh_user}" "/home/${ssh_user}/.ssh"
-
-        cat > "/etc/sudoers.d/90-ansible-${ssh_user}" <<EOF
-${ssh_user} ALL=(ALL) NOPASSWD: ALL
-EOF
-        chmod 0440 "/etc/sudoers.d/90-ansible-${ssh_user}"
-        visudo -c >/dev/null 2>&1 && m2_hist "visudo -c" || true
-
-        if [ -f /etc/ssh/sshd_config ]; then
-            sed -i -E "s/^#?Port[[:space:]]+.*/Port ${ssh_port}/" /etc/ssh/sshd_config
-            if ! grep -qE "^Port[[:space:]]+${ssh_port}" /etc/ssh/sshd_config; then
-                echo "Port ${ssh_port}" >> /etc/ssh/sshd_config
-            fi
-            if grep -qE "^#?AllowUsers[[:space:]]+" /etc/ssh/sshd_config; then
-                if ! grep -qE "^#?AllowUsers[[:space:]]+.*\b${ssh_user}\b" /etc/ssh/sshd_config; then
-                    sed -i -E "s/^(#?AllowUsers[[:space:]]+.*)/\1 ${ssh_user}/" /etc/ssh/sshd_config
-                fi
-            else
-                echo "AllowUsers ${ssh_user} root" >> /etc/ssh/sshd_config
-            fi
-            m2_hist "nano /etc/ssh/sshd_config"
-        fi
-
-        if systemctl list-unit-files 2>/dev/null | grep -q '^sshd\.service'; then
-            m2_run "systemctl enable --now sshd"
-            m2_run "systemctl restart sshd"
-        else
-            m2_run "systemctl enable --now ssh"
-            m2_run "systemctl restart ssh"
-        fi
-
-        echo "SSH готов на $role: пользователь=$ssh_user, порт=$ssh_port, sudo NOPASSWD включён."
     }
 
     m2_step1_samba_ad() {
@@ -743,35 +728,11 @@ EOF
         local role="$1"
         echo "Пункты для $role:"
         case "$role" in
-            ISP)
-                echo "  4 — Chrony (сервер времени)"
-                echo "  s — Подготовить SSH и пользователя для Ansible на этом узле"
-                echo "  n — Nginx reverse-proxy + auth_basic"
-                ;;
-            HQ-RTR|BR-RTR)
-                echo "  4 — Chrony (клиент времени)"
-                echo "  8 — DNAT (проброс 8080 и SSH)"
-                echo "  s — Подготовить SSH и пользователя для Ansible на этом узле"
-                ;;
-            HQ-SRV)
-                echo "  2 — RAID (выбор уровня 0/1/3/4/5/6/10 и дисков -> /raid)"
-                echo "  3 — NFS сервер (/raid/nfs)"
-                echo "  4 — Chrony (клиент времени)"
-                echo "  7 — Веб-приложение (Apache + MariaDB)"
-                echo "  s — Подготовить SSH и пользователя для Ansible на этом узле"
-                ;;
             BR-SRV)
                 echo "  1 — Samba DC, политика паролей, группа hq и hquser1..5"
                 echo "  4 — Chrony (клиент времени)"
                 echo "  5 — SSH-ключи, проверка связи и Ansible (/etc/ansible)"
                 echo "  6 — Docker (testapp)"
-                ;;
-            HQ-CLI)
-                echo "  s — Подготовить SSH и пользователя (до ввода в домен, без конфликта)"
-                echo "  1 — Ввод в домен и sudo для группы hq"
-                echo "  3 — NFS клиент (/mnt/nfs)"
-                echo "  4 — Chrony (клиент времени)"
-                echo "  h — Прописать web/docker.${DOMAIN_NAME} в /etc/hosts"
                 ;;
             *)
                 echo "  s — Подготовить SSH и пользователя для Ansible на этом узле"
@@ -782,7 +743,7 @@ EOF
     m2_run_role_item() {
         local role="$1" item="$2"
         case "$item" in
-            s|S) m2_ensure_ssh_ready "$role" ;;
+            s|S) m2_fast_ssh_only "$role" ;;
             1)   m2_step1_samba_ad "$role" ;;
             2)   m2_step2_raid ;;
             3)   m2_step3_nfs "$role" ;;
@@ -798,9 +759,7 @@ EOF
 
     local ROLE
     ROLE="$(m2_detect_role)"
-    if [ -n "$ROLE" ]; then
-        ROLE="$(m2_ask "Машина" "$ROLE")"
-    else
+    if [ -z "$ROLE" ]; then
         select ROLE in ISP HQ-RTR BR-RTR BR-FW HQ-SRV BR-SRV HQ-CLI; do
             [ -n "$ROLE" ] && break
         done
@@ -808,53 +767,25 @@ EOF
 
     m2_ensure_packages "$ROLE"
 
-    echo "1 — Все задачи для $ROLE"
-    echo "2 — Конкретный пункт (мини-список для $ROLE)"
-    local MODE
-    MODE="$(m2_ask "Режим" "1")"
-
-    if [ "$MODE" = "2" ]; then
-        m2_print_role_mini_menu "$ROLE"
-        local ITEM
-        ITEM="$(m2_ask "Выберите пункт" "1")"
-        m2_run_role_item "$ROLE" "$ITEM"
+    if [ "$ROLE" != "BR-SRV" ]; then
+        m2_fast_ssh_only "$ROLE"
     else
-        case "$ROLE" in
-            ISP)
-                m2_ensure_ssh_ready "$ROLE"
-                m2_step4_chrony "$ROLE"
-                if [ "$(m2_ask_yn "Настроить nginx proxy + auth_basic? (д/н)" "н")" = "y" ]; then
-                    m2_step_nginx_optional "$ROLE"
-                fi
-                ;;
-            HQ-RTR|BR-RTR)
-                m2_ensure_ssh_ready "$ROLE"
-                m2_step4_chrony "$ROLE"
-                m2_step8_dnat "$ROLE"
-                ;;
-            HQ-SRV)
-                m2_ensure_ssh_ready "$ROLE"
-                m2_step2_raid
-                m2_step3_nfs "$ROLE"
-                m2_step4_chrony "$ROLE"
-                m2_step7_web_app
-                ;;
-            BR-SRV)
-                m2_step1_samba_ad "$ROLE"
-                m2_step4_chrony "$ROLE"
-                m2_step5_ansible
-                m2_step6_docker_app
-                ;;
-            HQ-CLI)
-                m2_ensure_ssh_ready "$ROLE"
-                m2_step1_samba_ad "$ROLE"
-                m2_step3_nfs "$ROLE"
-                m2_step4_chrony "$ROLE"
-                if [ "$(m2_ask_yn "Прописать web/docker в /etc/hosts? (д/н)" "н")" = "y" ]; then
-                    m2_step_nginx_optional "$ROLE"
-                fi
-                ;;
-        esac
+        echo "1 — Все задачи для $ROLE"
+        echo "2 — Конкретный пункт (мини-список для $ROLE)"
+        local MODE
+        MODE="$(m2_ask "Режим" "1")"
+
+        if [ "$MODE" = "2" ]; then
+            m2_print_role_mini_menu "$ROLE"
+            local ITEM
+            ITEM="$(m2_ask "Выберите пункт" "1")"
+            m2_run_role_item "$ROLE" "$ITEM"
+        else
+            m2_step1_samba_ad "$ROLE"
+            m2_step4_chrony "$ROLE"
+            m2_step5_ansible
+            m2_step6_docker_app
+        fi
     fi
 
     history -a
