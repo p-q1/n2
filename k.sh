@@ -7,7 +7,7 @@ IP_ISP="172.16.1.1"
 IP_HQ_RTR="172.16.1.2"
 IP_BR_RTR="172.16.2.2"
 IP_HQ_SRV="192.168.10.2"
-IP_BR_SRV="192.168.20.2"
+IP_BR_SRV="192.168.0.2"
 IP_HQ_CLI="192.168.10.10"
 
 HQ_CLI_NET="192.168.10.0/24"
@@ -127,7 +127,8 @@ stage1_node_prepare_and_ssh() {
   touch /root/.ssh/authorized_keys
   chmod 600 /root/.ssh/authorized_keys
   if [ ! -f /root/.ssh/id_ed25519 ]; then
-    ssh-keygen -t ed25519 -N "" -f /root/.ssh/id_ed25519
+    rm -f /root/.ssh/id_ed25519*
+    ssh-keygen -q -t ed25519 -N "" -f /root/.ssh/id_ed25519
   fi
   if [ -n "$AUTHORIZED_PUBKEY" ]; then
     grep -qxF "$AUTHORIZED_PUBKEY" /root/.ssh/authorized_keys || \
@@ -322,7 +323,10 @@ EOF
 
   mkdir -p /root/.ssh
   chmod 700 /root/.ssh
-  [ -f /root/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N "" -f /root/.ssh/id_ed25519
+  if [ ! -f /root/.ssh/id_ed25519 ]; then
+    rm -f /root/.ssh/id_ed25519*
+    ssh-keygen -q -t ed25519 -N "" -f /root/.ssh/id_ed25519
+  fi
 
   ssh_push_key() {
     local user="$1" host="$2" port="$3"
@@ -352,6 +356,7 @@ rtcsync
 local stratum 5
 allow 172.16.0.0/12
 allow 192.168.0.0/16
+allow 192.168.10.0/24
 CHR
 systemctl enable --now chronyd 2>/dev/null || systemctl enable --now chrony 2>/dev/null || true
 systemctl restart chronyd 2>/dev/null || systemctl restart chrony 2>/dev/null || true
@@ -359,7 +364,7 @@ chronyc tracking || true
 EOF
   log "[BR-SRV] Выход из сессии ISP выполнен."
 
-  log "[BR-SRV -> HQ-RTR] chrony + DNAT 8080/2027 + сохранение правил..."
+  log "[BR-SRV -> HQ-RTR] chrony + DNAT 8080/2027 + FORWARD..."
   ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p 22 "net_admin@${IP_HQ_RTR}" "sudo bash -s" <<EOF
 set -euo pipefail
 
@@ -391,6 +396,9 @@ if command -v nft >/dev/null 2>&1; then
   nft list chain ip nat postrouting 2>/dev/null | grep -q 'masquerade' || \
     nft add rule ip nat postrouting masquerade
 
+  nft add table ip filter 2>/dev/null || true
+  nft add chain ip filter forward '{ type filter hook forward priority 0; policy accept; }' 2>/dev/null || true
+
   nft list ruleset > /etc/nftables.conf
   systemctl enable --now nftables 2>/dev/null || true
 else
@@ -402,6 +410,8 @@ else
 
   iptables -t nat -C POSTROUTING -j MASQUERADE 2>/dev/null || \
     iptables -t nat -A POSTROUTING -j MASQUERADE
+  
+  iptables -P FORWARD ACCEPT
 
   mkdir -p /etc/iptables
   iptables-save > /etc/iptables/rules.v4
@@ -409,7 +419,7 @@ else
 fi
 EOF
 
-  log "[BR-SRV -> BR-RTR] chrony + DNAT 8080/2027 + сохранение правил..."
+  log "[BR-SRV -> BR-RTR] chrony + DNAT 8080/2027 + FORWARD..."
   ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p 22 "net_admin@${IP_BR_RTR}" "sudo bash -s" <<EOF
 set -euo pipefail
 
@@ -441,6 +451,9 @@ if command -v nft >/dev/null 2>&1; then
   nft list chain ip nat postrouting 2>/dev/null | grep -q 'masquerade' || \
     nft add rule ip nat postrouting masquerade
 
+  nft add table ip filter 2>/dev/null || true
+  nft add chain ip filter forward '{ type filter hook forward priority 0; policy accept; }' 2>/dev/null || true
+
   nft list ruleset > /etc/nftables.conf
   systemctl enable --now nftables 2>/dev/null || true
 else
@@ -452,6 +465,8 @@ else
 
   iptables -t nat -C POSTROUTING -j MASQUERADE 2>/dev/null || \
     iptables -t nat -A POSTROUTING -j MASQUERADE
+
+  iptables -P FORWARD ACCEPT
 
   mkdir -p /etc/iptables
   iptables-save > /etc/iptables/rules.v4
@@ -705,6 +720,8 @@ nft add chain ip nat postrouting
 nft add rule ip nat prerouting iifname "eth0" tcp dport 8080 dnat to 192.168.10.2:80
 nft add rule ip nat prerouting iifname "eth0" tcp dport 2027 dnat to 192.168.10.2:2027
 nft add rule ip nat postrouting masquerade
+nft add table ip filter
+nft add chain ip filter forward '{ type filter hook forward priority 0; policy accept; }'
 nft list ruleset > /etc/nftables.conf
 systemctl enable --now nftables
 HIST
@@ -725,9 +742,11 @@ sysctl -w net.ipv4.ip_forward=1
 nft add table ip nat
 nft add chain ip nat prerouting
 nft add chain ip nat postrouting
-nft add rule ip nat prerouting iifname "eth0" tcp dport 8080 dnat to 192.168.20.2:8080
-nft add rule ip nat prerouting iifname "eth0" tcp dport 2027 dnat to 192.168.20.2:2027
+nft add rule ip nat prerouting iifname "eth0" tcp dport 8080 dnat to 192.168.0.2:8080
+nft add rule ip nat prerouting iifname "eth0" tcp dport 2027 dnat to 192.168.0.2:2027
 nft add rule ip nat postrouting masquerade
+nft add table ip filter
+nft add chain ip filter forward '{ type filter hook forward priority 0; policy accept; }'
 nft list ruleset > /etc/nftables.conf
 systemctl enable --now nftables
 HIST
