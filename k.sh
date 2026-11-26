@@ -198,7 +198,7 @@ EOF
       rm -f /etc/samba/smb.conf
       rm -rf /var/lib/samba/private
       samba-tool domain provision --realm="$AD_REALM" --domain="HQ" --adminpass="$AD_ADMIN_PASS" --dns-backend=SAMBA_INTERNAL --server-role=dc --use-rfc2307
-      cp /var/lib/samba/private/krb5.conf /etc/krb5.conf
+      cp -f /var/lib/samba/private/krb5.conf /etc/krb5.conf
       systemctl enable --now samba
       sleep 2
     fi
@@ -246,10 +246,10 @@ EOF
 
   COMPOSE_FILE=""
   if [ -f "$ISO_MOUNT/docker/compose.yaml" ]; then
-    cp "$ISO_MOUNT/docker/compose.yaml" .
+    cp -f "$ISO_MOUNT/docker/compose.yaml" .
     COMPOSE_FILE="compose.yaml"
   elif [ -f "$ISO_MOUNT/compose.yaml" ]; then
-    cp "$ISO_MOUNT/compose.yaml" .
+    cp -f "$ISO_MOUNT/compose.yaml" .
     COMPOSE_FILE="compose.yaml"
   else
     log "[BR-SRV][WARN] compose.yaml не найден в ISO. Создаем свой..."
@@ -297,6 +297,7 @@ host_key_checking = False
 interpreter_python = /usr/bin/python3
 deprecation_warnings = False
 localhost_warning = False
+timeout = 10
 EOF
 
   cat > /etc/ansible/hosts <<EOF
@@ -326,8 +327,10 @@ EOF
   ssh_push_key() {
     local user="$1" host="$2" port="$3"
     ssh-keyscan -p "$port" -H "$host" >> /root/.ssh/known_hosts 2>/dev/null || true
-    sshpass -p "$SSH_PASS" ssh-copy-id -i /root/.ssh/id_ed25519.pub \
-      -o StrictHostKeyChecking=no -p "$port" "${user}@${host}" >/dev/null 2>&1 || true
+    local pubkey
+    pubkey="$(cat /root/.ssh/id_ed25519.pub)"
+    sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -p "$port" "${user}@${host}" \
+      "mkdir -p ~/.ssh && chmod 700 ~/.ssh && grep -qxF '$pubkey' ~/.ssh/authorized_keys 2>/dev/null || echo '$pubkey' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" || true
   }
 
   ssh_push_key "net_admin" "$IP_ISP" "22"
@@ -337,7 +340,7 @@ EOF
   ssh_push_key "net_admin" "$IP_BR_RTR" "22"
 
   log "[BR-SRV -> ISP] Настройка chrony stratum 5..."
-  ssh -o StrictHostKeyChecking=no -p 22 "net_admin@${IP_ISP}" "sudo bash -s" <<EOF
+  ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p 22 "net_admin@${IP_ISP}" "sudo bash -s" <<EOF
 set -euo pipefail
 CHRONY_CONF=/etc/chrony.conf
 [ -f /etc/chrony/chrony.conf ] && CHRONY_CONF=/etc/chrony/chrony.conf
@@ -358,11 +361,11 @@ EOF
 
   log "[BR-SRV -> HQ-SRV] Настройка RAID0, NFS, Apache+MariaDB, chrony..."
   if [ -d "$ISO_MOUNT/web" ]; then
-    scp -o StrictHostKeyChecking=no -P "$SSH_PORT_HQ_SRV" -r \
+    scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 -P "$SSH_PORT_HQ_SRV" -r \
       "$ISO_MOUNT/web" "sshuser@${IP_HQ_SRV}:/tmp/web_src" || true
   fi
 
-  ssh -o StrictHostKeyChecking=no -p "$SSH_PORT_HQ_SRV" "sshuser@${IP_HQ_SRV}" "sudo bash -s" <<EOF
+  ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p "$SSH_PORT_HQ_SRV" "sshuser@${IP_HQ_SRV}" "sudo bash -s" <<EOF
 set -euo pipefail
 
 CHRONY_CONF=/etc/chrony.conf
@@ -428,8 +431,8 @@ if [ -d /tmp/web_src ]; then
   [ -d /var/www/apache2/htdocs ] && WEB_ROOT="/var/www/apache2/htdocs"
   mkdir -p "\$WEB_ROOT"
 
-  [ -f /tmp/web_src/index.php ] && cp /tmp/web_src/index.php "\$WEB_ROOT/index.php"
-  [ -f /tmp/web_src/logo.png ] && cp /tmp/web_src/logo.png "\$WEB_ROOT/logo.png"
+  [ -f /tmp/web_src/index.php ] && cp -f /tmp/web_src/index.php "\$WEB_ROOT/index.php"
+  [ -f /tmp/web_src/logo.png ] && cp -f /tmp/web_src/logo.png "\$WEB_ROOT/logo.png"
 
   if [ -f "\$WEB_ROOT/index.php" ]; then
     sed -i \
@@ -446,7 +449,7 @@ fi
 EOF
 
   log "[BR-SRV -> HQ-CLI] Ввод в домен, sudo hq, NFS, chrony, браузер..."
-  ssh -o StrictHostKeyChecking=no -p 22 "sshuser@${IP_HQ_CLI}" "sudo bash -s" <<EOF
+  ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p 22 "sshuser@${IP_HQ_CLI}" "sudo bash -s" <<EOF
 set -euo pipefail
 
 CHRONY_CONF=/etc/chrony.conf
@@ -461,7 +464,7 @@ systemctl enable --now chronyd 2>/dev/null || systemctl enable --now chrony 2>/d
 systemctl restart chronyd 2>/dev/null || systemctl restart chrony 2>/dev/null || true
 
 if ! grep -q "nameserver $IP_BR_SRV" /etc/resolv.conf 2>/dev/null; then
-  cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null || true
+  cp -f /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null || true
   { echo "nameserver $IP_BR_SRV"; cat /etc/resolv.conf.bak 2>/dev/null || true; } > /etc/resolv.conf
 fi
 
@@ -512,7 +515,7 @@ fi
 EOF
 
   log "[BR-SRV -> HQ-RTR] chrony + DNAT 8080/2027 + сохранение правил..."
-  ssh -o StrictHostKeyChecking=no -p 22 "net_admin@${IP_HQ_RTR}" "sudo bash -s" <<EOF
+  ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p 22 "net_admin@${IP_HQ_RTR}" "sudo bash -s" <<EOF
 set -euo pipefail
 
 CHRONY_CONF=/etc/chrony.conf
@@ -562,7 +565,7 @@ fi
 EOF
 
   log "[BR-SRV -> BR-RTR] chrony + DNAT 8080/2027 + сохранение правил..."
-  ssh -o StrictHostKeyChecking=no -p 22 "net_admin@${IP_BR_RTR}" "sudo bash -s" <<EOF
+  ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p 22 "net_admin@${IP_BR_RTR}" "sudo bash -s" <<EOF
 set -euo pipefail
 
 CHRONY_CONF=/etc/chrony.conf
