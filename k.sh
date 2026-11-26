@@ -28,6 +28,7 @@ m2_main() {
     local HQ_CLI_NET="192.168.200.0/28"
     local HQ_CLI_IP_FALLBACK="192.168.200.2"
     local ISP_NTP_DEFAULT="172.16.1.1"
+    local ISP_IP_DEFAULT="172.16.1.1"
 
     m2_hist() {
         history -s "$1" 2>/dev/null || true
@@ -64,6 +65,24 @@ m2_main() {
         done
     }
 
+    m2_pkg_installed() {
+        local pkg="$1"
+        if command -v rpm >/dev/null 2>&1; then
+            if rpm -q "$pkg" >/dev/null 2>&1; then
+                return 0
+            fi
+            if rpm -q --whatprovides "$pkg" >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+        if command -v dpkg >/dev/null 2>&1; then
+            if dpkg -s "$pkg" >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+        return 1
+    }
+
     m2_detect_role() {
         local hn
         hn="$(hostname -s 2>/dev/null || hostname)"
@@ -77,6 +96,28 @@ m2_main() {
             *hq-cli*) echo "HQ-CLI" ;;
             *)        echo "" ;;
         esac
+    }
+
+    m2_select_and_confirm_role() {
+        local cur_hn det_role chosen_role
+        cur_hn="$(hostname 2>/dev/null || echo unknown)"
+        det_role="$(m2_detect_role)"
+
+        echo "=========================================="
+        echo "Текущий hostname: $cur_hn"
+        if [ -n "$det_role" ]; then
+            echo "Автоопределённая роль: $det_role"
+            chosen_role="$(m2_ask "Подтвердите или укажите роль машины (ISP, HQ-RTR, BR-RTR, BR-FW, HQ-SRV, BR-SRV, HQ-CLI)" "$det_role")"
+        else
+            echo "Автоопределить роль по hostname не удалось."
+            select chosen_role in ISP HQ-RTR BR-RTR BR-FW HQ-SRV BR-SRV HQ-CLI; do
+                [ -n "$chosen_role" ] && break
+            done
+        fi
+        chosen_role="${chosen_role^^}"
+        echo "Выбрана машина / роль: $chosen_role (hostname: $cur_hn)"
+        echo "=========================================="
+        echo "$chosen_role"
     }
 
     m2_role_pkg_list() {
@@ -105,23 +146,33 @@ m2_main() {
 
     m2_ensure_packages() {
         local role="$1"
-        local req_pkgs missing="" pkg
+        local req_pkgs already="" missing="" pkg
         req_pkgs="$(m2_role_pkg_list "$role")"
 
         for pkg in $req_pkgs; do
-            if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+            if m2_pkg_installed "$pkg"; then
+                already="$already $pkg"
+            else
                 missing="$missing $pkg"
             fi
         done
 
         if [ "$role" = "HQ-CLI" ]; then
-            if ! dpkg -s yandex-browser-stable >/dev/null 2>&1 && ! dpkg -s yandex-browser >/dev/null 2>&1; then
+            if m2_pkg_installed "yandex-browser-stable" || m2_pkg_installed "yandex-browser"; then
+                already="$already yandex-browser"
+            else
                 missing="$missing yandex-browser-stable"
             fi
         fi
 
-        if [ -n "$missing" ]; then
-            echo "Автоустановка недостающих пакетов:$missing"
+        [ -n "$already" ] && echo "[$role] Уже установлены:$already"
+        if [ -z "$missing" ]; then
+            echo "[$role] Все требуемые пакеты уже на месте, докачка не требуется."
+            return 0
+        fi
+
+        echo "[$role] Недостающие пакеты:$missing"
+        if command -v apt-get >/dev/null 2>&1; then
             m2_run "apt-get update"
             local m
             for m in $missing; do
@@ -136,6 +187,12 @@ m2_main() {
                 else
                     apt-get install -y "$m" && m2_hist "apt-get install -y $m" || echo "Не удалось поставить $m"
                 fi
+            done
+        elif command -v apt-repo >/dev/null 2>&1 || command -v apt >/dev/null 2>&1; then
+            m2_run "apt-get update"
+            local m
+            for m in $missing; do
+                apt-get install -y "$m" && m2_hist "apt-get install -y $m" || echo "Не удалось поставить $m"
             done
         fi
     }
@@ -203,13 +260,14 @@ EOF
     m2_step1_samba_ad() {
         local role="$1"
         if [ "$role" = "BR-SRV" ]; then
-            local admin_pass user_pass
+            local admin_pass user_pass fwd_ip
             admin_pass="$(m2_ask_secret "Пароль Администратора домена" "P@ssw0rd")"
             user_pass="$(m2_ask_secret "Пароль для hquser1..5" "P@ssw0rd")"
+            fwd_ip="$(m2_ask "DNS forwarder для Samba DC" "$HQ_SRV_IP")"
 
             if ! systemctl is-active --quiet samba 2>/dev/null; then
                 if [ -z "$(awk '/^nameserver/{print $2}' /etc/resolv.conf 2>/dev/null)" ]; then
-                    echo "nameserver $HQ_SRV_IP" > /etc/resolv.conf
+                    echo "nameserver $fwd_ip" > /etc/resolv.conf
                     m2_hist "nano /etc/resolv.conf"
                 fi
                 systemctl stop samba 2>/dev/null || true
@@ -225,9 +283,9 @@ EOF
                     --domain="$WORKGROUP_NAME" \
                     --server-role=dc \
                     --dns-backend=SAMBA_INTERNAL \
-                    --option="dns forwarder = ${HQ_SRV_IP}" \
+                    --option="dns forwarder = ${fwd_ip}" \
                     --adminpass="$admin_pass"
-                m2_hist "samba-tool domain provision --use-rfc2307 --realm=${DOMAIN_REALM} --domain=${WORKGROUP_NAME} --server-role=dc --dns-backend=SAMBA_INTERNAL --option=\"dns forwarder = ${HQ_SRV_IP}\""
+                m2_hist "samba-tool domain provision --use-rfc2307 --realm=${DOMAIN_REALM} --domain=${WORKGROUP_NAME} --server-role=dc --dns-backend=SAMBA_INTERNAL --option=\"dns forwarder = ${fwd_ip}\""
 
                 if [ -f /var/lib/samba/private/krb5.conf ]; then
                     \cp -f /var/lib/samba/private/krb5.conf /etc/krb5.conf
@@ -548,6 +606,70 @@ EOF
         m2_hist "cd /etc/ansible && ansible all -m ping"
     }
 
+    m2_remote_connect_and_tune() {
+        while true; do
+            echo ""
+            echo "Подключение к другой машине с BR-SRV:"
+            echo "  1 — hq-srv ($HQ_SRV_IP)"
+            echo "  2 — hq-cli ($HQ_CLI_IP_FALLBACK)"
+            echo "  3 — hq-rtr ($HQ_RTR_IP)"
+            echo "  4 — br-rtr ($BR_RTR_IP)"
+            echo "  5 — isp ($ISP_IP_DEFAULT)"
+            echo "  6 — br-fw (свой IP)"
+            echo "  0 — Завершить работу с удалёнными машинами"
+            local pick
+            pick="$(m2_ask "Выберите машину" "0")"
+            case "$pick" in
+                0) break ;;
+            esac
+
+            local def_ip="192.168.100.2" def_user="sshuser" def_port="$SSH_PORT_DEFAULT" label="NODE"
+            case "$pick" in
+                1) label="HQ-SRV"; def_ip="$HQ_SRV_IP"; def_user="sshuser"; def_port="$SSH_PORT_DEFAULT" ;;
+                2) label="HQ-CLI"; def_ip="$HQ_CLI_IP_FALLBACK"; def_user="sshuser"; def_port="22" ;;
+                3) label="HQ-RTR"; def_ip="$HQ_RTR_IP"; def_user="net_admin"; def_port="22" ;;
+                4) label="BR-RTR"; def_ip="$BR_RTR_IP"; def_user="net_admin"; def_port="22" ;;
+                5) label="ISP"; def_ip="$ISP_IP_DEFAULT"; def_user="sshuser"; def_port="22" ;;
+                6) label="BR-FW"; def_ip="192.168.0.1"; def_user="sshuser"; def_port="22" ;;
+                *) echo "Неверный выбор."; continue ;;
+            esac
+
+            local ip u p act
+            ip="$(m2_ask "$label: уточните IP" "$def_ip")"
+            u="$(m2_ask "$label: уточните SSH-пользователя" "$def_user")"
+            p="$(m2_ask "$label: уточните SSH-порт" "$def_port")"
+
+            echo "Что сделать на $label ($u@$ip:$p)?"
+            echo "  1 — Открыть интерактивную SSH-сессию"
+            echo "  2 — Выполнить команду / уточнение настройки по SSH"
+            echo "  3 — Проверить состояние служб и сети (uptime, ip, ss, chronyc)"
+            act="$(m2_ask "Действие" "1")"
+
+            local key_opt=""
+            [ -f /root/.ssh/ansible ] && key_opt="-i /root/.ssh/ansible"
+
+            case "$act" in
+                1)
+                    ssh $key_opt -o StrictHostKeyChecking=no -p "$p" "${u}@${ip}" || true
+                    m2_hist "ssh $key_opt -p $p ${u}@${ip}"
+                    ;;
+                2)
+                    local rcmd
+                    rcmd="$(m2_ask "Команда для выполнения на $label" "sudo -n id; uname -a")"
+                    ssh $key_opt -o StrictHostKeyChecking=no -p "$p" "${u}@${ip}" "$rcmd" || true
+                    m2_hist "ssh $key_opt -p $p ${u}@${ip} \"$rcmd\""
+                    ;;
+                3)
+                    ssh $key_opt -o StrictHostKeyChecking=no -p "$p" "${u}@${ip}" \
+                        "hostname; ip -4 -br addr; ss -tlnp 2>/dev/null | grep -E ':(22|2027|80|8080|2049|389|445)\b' || true; chronyc tracking 2>/dev/null || true" || true
+                    ;;
+                *)
+                    echo "Неизвестное действие."
+                    ;;
+            esac
+        done
+    }
+
     m2_step6_docker_app() {
         m2_run "systemctl enable --now docker"
         mkdir -p /root/testapp
@@ -674,7 +796,7 @@ SQL
             auth_user="$(m2_ask "Логин для Basic Auth" "admin")"
             auth_pass="$(m2_ask_secret "Пароль для Basic Auth" "P@ssw0rd")"
             isp_ip="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)"
-            isp_ip="${isp_ip:-172.16.1.1}"
+            isp_ip="${isp_ip:-$ISP_IP_DEFAULT}"
 
             mkdir -p /etc/nginx/sites-available.d /etc/nginx/sites-enabled.d /etc/nginx
             if command -v htpasswd >/dev/null 2>&1; then
@@ -716,7 +838,7 @@ EOF
             m2_run "systemctl restart nginx"
         elif [ "$role" = "HQ-CLI" ]; then
             local isp_ip
-            isp_ip="$(m2_ask "IP адрес ISP для /etc/hosts" "$ISP_NTP_DEFAULT")"
+            isp_ip="$(m2_ask "IP адрес ISP для /etc/hosts" "$ISP_IP_DEFAULT")"
             if ! grep -q "web.${DOMAIN_NAME}" /etc/hosts 2>/dev/null; then
                 echo "${isp_ip} web.${DOMAIN_NAME} docker.${DOMAIN_NAME}" >> /etc/hosts
                 m2_hist "nano /etc/hosts"
@@ -733,6 +855,7 @@ EOF
                 echo "  4 — Chrony (клиент времени)"
                 echo "  5 — SSH-ключи, проверка связи и Ansible (/etc/ansible)"
                 echo "  6 — Docker (testapp)"
+                echo "  r — Подключиться к другой машине и настроить/уточнить"
                 ;;
             *)
                 echo "  s — Подготовить SSH и пользователя для Ansible на этом узле"
@@ -752,25 +875,29 @@ EOF
             6)   m2_step6_docker_app ;;
             7)   m2_step7_web_app ;;
             8)   m2_step8_dnat "$role" ;;
+            r|R) m2_remote_connect_and_tune ;;
             n|N|h|H) m2_step_nginx_optional "$role" ;;
             *)   echo "Неизвестный пункт: $item" ;;
         esac
     }
 
     local ROLE
-    ROLE="$(m2_detect_role)"
-    if [ -z "$ROLE" ]; then
-        select ROLE in ISP HQ-RTR BR-RTR BR-FW HQ-SRV BR-SRV HQ-CLI; do
-            [ -n "$ROLE" ] && break
-        done
-    fi
+    ROLE="$(m2_select_and_confirm_role)"
 
     m2_ensure_packages "$ROLE"
 
     if [ "$ROLE" != "BR-SRV" ]; then
         m2_fast_ssh_only "$ROLE"
     else
-        echo "1 — Все задачи для $ROLE"
+        echo "Уточнение параметров BR-SRV:"
+        DOMAIN_NAME="$(m2_ask "Домен (DNS)" "$DOMAIN_NAME")"
+        DOMAIN_REALM="${DOMAIN_NAME^^}"
+        WORKGROUP_NAME="$(m2_ask "Рабочая группа (NETBIOS)" "$WORKGROUP_NAME")"
+        ISP_NTP_DEFAULT="$(m2_ask "IP сервера времени (ISP)" "$ISP_NTP_DEFAULT")"
+        HQ_SRV_IP="$(m2_ask "IP HQ-SRV" "$HQ_SRV_IP")"
+        BR_SRV_IP="$(m2_ask "IP BR-SRV" "$BR_SRV_IP")"
+
+        echo "1 — Все задачи для $ROLE (Samba DC, Chrony, SSH/Ansible, Docker) + подключение к другим машинам"
         echo "2 — Конкретный пункт (мини-список для $ROLE)"
         local MODE
         MODE="$(m2_ask "Режим" "1")"
@@ -781,10 +908,21 @@ EOF
             ITEM="$(m2_ask "Выберите пункт" "1")"
             m2_run_role_item "$ROLE" "$ITEM"
         else
-            m2_step1_samba_ad "$ROLE"
-            m2_step4_chrony "$ROLE"
-            m2_step5_ansible
-            m2_step6_docker_app
+            if [ "$(m2_ask_yn "Настроить Samba DC? (д/н)" "д")" = "y" ]; then
+                m2_step1_samba_ad "$ROLE"
+            fi
+            if [ "$(m2_ask_yn "Настроить Chrony? (д/н)" "д")" = "y" ]; then
+                m2_step4_chrony "$ROLE"
+            fi
+            if [ "$(m2_ask_yn "Настроить SSH-ключи и Ansible? (д/н)" "д")" = "y" ]; then
+                m2_step5_ansible
+            fi
+            if [ "$(m2_ask_yn "Развернуть Docker testapp? (д/н)" "д")" = "y" ]; then
+                m2_step6_docker_app
+            fi
+            if [ "$(m2_ask_yn "Подключиться к другим машинам для настройки/уточнений? (д/н)" "д")" = "y" ]; then
+                m2_remote_connect_and_tune
+            fi
         fi
     fi
 
