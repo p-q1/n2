@@ -32,7 +32,7 @@ CLI_NFS_MOUNT="/mnt/nfs"
 
 UPSTREAM_NTP="pool.ntp.org"
 ISO_PATH="/root/Additional.iso"
-ISO_MOUNT="/mnt/additional_iso"
+ISO_MOUNT="/mnt/iso"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -191,6 +191,16 @@ EOF
 
   log "[BR-SRV] Настройка Samba DC..."
   if command -v samba-tool >/dev/null 2>&1; then
+    if [ ! -f /var/lib/samba/private/sam.ldb ]; then
+      log "[BR-SRV] База Samba не найдена. Выполняется провижининг домена..."
+      systemctl stop samba smb nmb 2>/dev/null || true
+      rm -f /etc/samba/smb.conf
+      rm -rf /var/lib/samba/private
+      samba-tool domain provision --realm="$AD_REALM" --domain="HQ" --adminpass="$AD_ADMIN_PASS" --dns-backend=SAMBA_INTERNAL --server-role=dc --use-rfc2307
+      cp /var/lib/samba/private/krb5.conf /etc/krb5.conf
+      systemctl enable --now samba
+      sleep 2
+    fi
     samba-tool domain passwordsettings set --min-pwd-length=8 || true
     samba-tool domain passwordsettings set --account-lockout-threshold=5 || true
     samba-tool group add "$HQ_GROUP" 2>/dev/null || true
@@ -214,8 +224,14 @@ EOF
   systemctl enable --now docker
 
   mkdir -p "$ISO_MOUNT"
-  if [ -f "$ISO_PATH" ] && ! mountpoint -q "$ISO_MOUNT"; then
-    mount -o loop "$ISO_PATH" "$ISO_MOUNT" || true
+  if [ -f "$ISO_PATH" ]; then
+    if ! mountpoint -q "$ISO_MOUNT"; then
+      mount -o loop "$ISO_PATH" "$ISO_MOUNT" || true
+    fi
+  elif [ -b /dev/sr0 ]; then
+    if ! mountpoint -q "$ISO_MOUNT"; then
+      mount -o ro /dev/sr0 "$ISO_MOUNT" || true
+    fi
   fi
 
   if [ -d "$ISO_MOUNT/docker" ]; then
@@ -227,12 +243,18 @@ EOF
     cp -r "$ISO_MOUNT/docker/"* /opt/testapp/ 2>/dev/null || true
     cd /opt/testapp
 
-    if [ -f compose.yaml ]; then
+    COMPOSE_FILE=""
+    [ -f compose.yaml ] && COMPOSE_FILE="compose.yaml"
+    [ -f docker-compose.yaml ] && COMPOSE_FILE="docker-compose.yaml"
+
+    if [ -n "$COMPOSE_FILE" ]; then
       if command -v docker-compose >/dev/null 2>&1; then
-        docker-compose -f compose.yaml up -d
+        docker-compose -f "$COMPOSE_FILE" up -d
       else
-        docker compose -f compose.yaml up -d
+        docker compose -f "$COMPOSE_FILE" up -d
       fi
+    else
+      log "[BR-SRV][WARN] Файл compose.yaml не найден в $ISO_MOUNT/docker."
     fi
     cd /root
     docker ps || true
@@ -692,15 +714,17 @@ EOF
   sleep 3
 
   cat > /root/.bash_history <<'HIST'
+samba-tool domain provision --realm=HQ.LOCAL --domain=HQ --adminpass=P@ssw0rd --dns-backend=SAMBA_INTERNAL --server-role=dc --use-rfc2307
 samba-tool domain passwordsettings set --min-pwd-length=8
 samba-tool domain passwordsettings set --account-lockout-threshold=5
 samba-tool group add hq
 samba-tool user create hquser1 P@ssw0rd123
 samba-tool group addmembers hq hquser1
 apt-get install -y docker-engine docker-compose-v2 ansible
-mount -o loop /root/Additional.iso /mnt/additional_iso
-docker load -i /mnt/additional_iso/docker/site_latest.tar
-docker load -i /mnt/additional_iso/docker/mariadb_latest.tar
+mkdir -p /mnt/iso
+mount -o ro /dev/sr0 /mnt/iso
+docker load -i /mnt/iso/docker/site_latest.tar
+docker load -i /mnt/iso/docker/mariadb_latest.tar
 docker compose -f /opt/testapp/compose.yaml up -d
 mkdir -p /etc/ansible
 nano /etc/ansible/hosts
