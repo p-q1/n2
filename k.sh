@@ -76,6 +76,7 @@ stage1_node_prepare_and_ssh() {
     sshpass \
     python3 \
     sudo \
+    nano \
     curl \
     wget \
     ca-certificates \
@@ -238,29 +239,54 @@ EOF
     for img in site_latest.tar mariadb_latest.tar; do
       [ -f "$ISO_MOUNT/docker/$img" ] && docker load -i "$ISO_MOUNT/docker/$img" || true
     done
-
-    mkdir -p /opt/testapp
-    cp -r "$ISO_MOUNT/docker/"* /opt/testapp/ 2>/dev/null || true
-    cd /opt/testapp
-
-    COMPOSE_FILE=""
-    [ -f compose.yaml ] && COMPOSE_FILE="compose.yaml"
-    [ -f docker-compose.yaml ] && COMPOSE_FILE="docker-compose.yaml"
-
-    if [ -n "$COMPOSE_FILE" ]; then
-      if command -v docker-compose >/dev/null 2>&1; then
-        docker-compose -f "$COMPOSE_FILE" up -d
-      else
-        docker compose -f "$COMPOSE_FILE" up -d
-      fi
-    else
-      log "[BR-SRV][WARN] Файл compose.yaml не найден в $ISO_MOUNT/docker."
-    fi
-    cd /root
-    docker ps || true
-  else
-    log "[BR-SRV][WARN] Не найден $ISO_MOUNT/docker."
   fi
+
+  mkdir -p /opt/testapp
+  cd /opt/testapp
+
+  COMPOSE_FILE=""
+  if [ -f "$ISO_MOUNT/docker/compose.yaml" ]; then
+    cp "$ISO_MOUNT/docker/compose.yaml" .
+    COMPOSE_FILE="compose.yaml"
+  elif [ -f "$ISO_MOUNT/compose.yaml" ]; then
+    cp "$ISO_MOUNT/compose.yaml" .
+    COMPOSE_FILE="compose.yaml"
+  else
+    log "[BR-SRV][WARN] compose.yaml не найден в ISO. Создаем свой..."
+    cat > compose.yaml <<'EOF'
+version: '3.8'
+services:
+  db:
+    image: mariadb:10.11
+    environment:
+      MYSQL_ROOT_PASSWORD: P@ssw0rd
+      MYSQL_DATABASE: webdb
+      MYSQL_USER: web
+      MYSQL_PASSWORD: P@ssw0rd
+  app:
+    image: site:latest
+    ports:
+      - "8080:80"
+    depends_on:
+      - db
+    environment:
+      DB_HOST: db
+      DB_USER: web
+      DB_PASS: P@ssw0rd
+      DB_NAME: webdb
+EOF
+    COMPOSE_FILE="compose.yaml"
+  fi
+
+  if [ -n "$COMPOSE_FILE" ]; then
+    if command -v docker-compose >/dev/null 2>&1; then
+      docker-compose -f "$COMPOSE_FILE" up -d
+    else
+      docker compose -f "$COMPOSE_FILE" up -d
+    fi
+  fi
+  cd /root
+  docker ps || true
 
   log "[BR-SRV] Формирование /etc/ansible..."
   mkdir -p /etc/ansible
@@ -646,7 +672,7 @@ apt-get install -y realmd sssd sssd-ad adcli krb5-user
 realm discover HQ.LOCAL
 realm join HQ.LOCAL -U Administrator
 realm permit --groups hq
-cat > /etc/sudoers.d/hq_restricted
+nano /etc/sudoers.d/hq_restricted
 visudo -cf /etc/sudoers.d/hq_restricted
 apt-get install -y nfs-common
 mkdir -p /mnt/nfs
@@ -725,7 +751,11 @@ mkdir -p /mnt/iso
 mount -o ro /dev/sr0 /mnt/iso
 docker load -i /mnt/iso/docker/site_latest.tar
 docker load -i /mnt/iso/docker/mariadb_latest.tar
-docker compose -f /opt/testapp/compose.yaml up -d
+mkdir -p /opt/testapp
+cd /opt/testapp
+nano compose.yaml
+docker compose up -d
+docker ps
 mkdir -p /etc/ansible
 nano /etc/ansible/hosts
 ansible targets -m ping
