@@ -329,7 +329,7 @@ EOF
     ssh-keyscan -p "$port" -H "$host" >> /root/.ssh/known_hosts 2>/dev/null || true
     local pubkey
     pubkey="$(cat /root/.ssh/id_ed25519.pub)"
-    sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -p "$port" "${user}@${host}" \
+    sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p "$port" "${user}@${host}" \
       "mkdir -p ~/.ssh && chmod 700 ~/.ssh && grep -qxF '$pubkey' ~/.ssh/authorized_keys 2>/dev/null || echo '$pubkey' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" || true
   }
 
@@ -340,7 +340,7 @@ EOF
   ssh_push_key "net_admin" "$IP_BR_RTR" "22"
 
   log "[BR-SRV -> ISP] Настройка chrony stratum 5..."
-  ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p 22 "net_admin@${IP_ISP}" "sudo bash -s" <<EOF
+  ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p 22 "net_admin@${IP_ISP}" "sudo bash -s" <<EOF
 set -euo pipefail
 CHRONY_CONF=/etc/chrony.conf
 [ -f /etc/chrony/chrony.conf ] && CHRONY_CONF=/etc/chrony/chrony.conf
@@ -359,13 +359,113 @@ chronyc tracking || true
 EOF
   log "[BR-SRV] Выход из сессии ISP выполнен."
 
+  log "[BR-SRV -> HQ-RTR] chrony + DNAT 8080/2027 + сохранение правил..."
+  ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p 22 "net_admin@${IP_HQ_RTR}" "sudo bash -s" <<EOF
+set -euo pipefail
+
+CHRONY_CONF=/etc/chrony.conf
+[ -f /etc/chrony/chrony.conf ] && CHRONY_CONF=/etc/chrony/chrony.conf
+cat > "\$CHRONY_CONF" <<CHR
+server $IP_ISP iburst
+driftfile /var/lib/chrony/drift
+makestep 1.0 3
+rtcsync
+CHR
+systemctl enable --now chronyd 2>/dev/null || systemctl enable --now chrony 2>/dev/null || true
+systemctl restart chronyd 2>/dev/null || systemctl restart chrony 2>/dev/null || true
+
+sysctl -w net.ipv4.ip_forward=1
+grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+
+if command -v nft >/dev/null 2>&1; then
+  nft add table ip nat 2>/dev/null || true
+  nft add chain ip nat prerouting '{ type nat hook prerouting priority dstnat; policy accept; }' 2>/dev/null || true
+  nft add chain ip nat postrouting '{ type nat hook postrouting priority srcnat; policy accept; }' 2>/dev/null || true
+
+  nft list chain ip nat prerouting 2>/dev/null | grep -q 'dport 8080 dnat to $IP_HQ_SRV:80' || \
+    nft add rule ip nat prerouting iifname "$EXT_IF_HQ_RTR" tcp dport 8080 dnat to $IP_HQ_SRV:80
+
+  nft list chain ip nat prerouting 2>/dev/null | grep -q 'dport $SSH_PORT_HQ_SRV dnat to $IP_HQ_SRV:$SSH_PORT_HQ_SRV' || \
+    nft add rule ip nat prerouting iifname "$EXT_IF_HQ_RTR" tcp dport $SSH_PORT_HQ_SRV dnat to $IP_HQ_SRV:$SSH_PORT_HQ_SRV
+
+  nft list chain ip nat postrouting 2>/dev/null | grep -q 'masquerade' || \
+    nft add rule ip nat postrouting masquerade
+
+  nft list ruleset > /etc/nftables.conf
+  systemctl enable --now nftables 2>/dev/null || true
+else
+  iptables -t nat -C PREROUTING -i "$EXT_IF_HQ_RTR" -p tcp --dport 8080 -j DNAT --to-destination "$IP_HQ_SRV:80" 2>/dev/null || \
+    iptables -t nat -A PREROUTING -i "$EXT_IF_HQ_RTR" -p tcp --dport 8080 -j DNAT --to-destination "$IP_HQ_SRV:80"
+
+  iptables -t nat -C PREROUTING -i "$EXT_IF_HQ_RTR" -p tcp --dport "$SSH_PORT_HQ_SRV" -j DNAT --to-destination "$IP_HQ_SRV:$SSH_PORT_HQ_SRV" 2>/dev/null || \
+    iptables -t nat -A PREROUTING -i "$EXT_IF_HQ_RTR" -p tcp --dport "$SSH_PORT_HQ_SRV" -j DNAT --to-destination "$IP_HQ_SRV:$SSH_PORT_HQ_SRV"
+
+  iptables -t nat -C POSTROUTING -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -A POSTROUTING -j MASQUERADE
+
+  mkdir -p /etc/iptables
+  iptables-save > /etc/iptables/rules.v4
+  command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save || true
+fi
+EOF
+
+  log "[BR-SRV -> BR-RTR] chrony + DNAT 8080/2027 + сохранение правил..."
+  ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p 22 "net_admin@${IP_BR_RTR}" "sudo bash -s" <<EOF
+set -euo pipefail
+
+CHRONY_CONF=/etc/chrony.conf
+[ -f /etc/chrony/chrony.conf ] && CHRONY_CONF=/etc/chrony/chrony.conf
+cat > "\$CHRONY_CONF" <<CHR
+server $IP_ISP iburst
+driftfile /var/lib/chrony/drift
+makestep 1.0 3
+rtcsync
+CHR
+systemctl enable --now chronyd 2>/dev/null || systemctl enable --now chrony 2>/dev/null || true
+systemctl restart chronyd 2>/dev/null || systemctl restart chrony 2>/dev/null || true
+
+sysctl -w net.ipv4.ip_forward=1
+grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+
+if command -v nft >/dev/null 2>&1; then
+  nft add table ip nat 2>/dev/null || true
+  nft add chain ip nat prerouting '{ type nat hook prerouting priority dstnat; policy accept; }' 2>/dev/null || true
+  nft add chain ip nat postrouting '{ type nat hook postrouting priority srcnat; policy accept; }' 2>/dev/null || true
+
+  nft list chain ip nat prerouting 2>/dev/null | grep -q 'dport 8080 dnat to $IP_BR_SRV:8080' || \
+    nft add rule ip nat prerouting iifname "$EXT_IF_BR_RTR" tcp dport 8080 dnat to $IP_BR_SRV:8080
+
+  nft list chain ip nat prerouting 2>/dev/null | grep -q 'dport $SSH_PORT_BR_SRV dnat to $IP_BR_SRV:$SSH_PORT_BR_SRV' || \
+    nft add rule ip nat prerouting iifname "$EXT_IF_BR_RTR" tcp dport $SSH_PORT_BR_SRV dnat to $IP_BR_SRV:$SSH_PORT_BR_SRV
+
+  nft list chain ip nat postrouting 2>/dev/null | grep -q 'masquerade' || \
+    nft add rule ip nat postrouting masquerade
+
+  nft list ruleset > /etc/nftables.conf
+  systemctl enable --now nftables 2>/dev/null || true
+else
+  iptables -t nat -C PREROUTING -i "$EXT_IF_BR_RTR" -p tcp --dport 8080 -j DNAT --to-destination "$IP_BR_SRV:8080" 2>/dev/null || \
+    iptables -t nat -A PREROUTING -i "$EXT_IF_BR_RTR" -p tcp --dport 8080 -j DNAT --to-destination "$IP_BR_SRV:8080"
+
+  iptables -t nat -C PREROUTING -i "$EXT_IF_BR_RTR" -p tcp --dport "$SSH_PORT_BR_SRV" -j DNAT --to-destination "$IP_BR_SRV:$SSH_PORT_BR_SRV" 2>/dev/null || \
+    iptables -t nat -A PREROUTING -i "$EXT_IF_BR_RTR" -p tcp --dport "$SSH_PORT_BR_SRV" -j DNAT --to-destination "$IP_BR_SRV:$SSH_PORT_BR_SRV"
+
+  iptables -t nat -C POSTROUTING -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -A POSTROUTING -j MASQUERADE
+
+  mkdir -p /etc/iptables
+  iptables-save > /etc/iptables/rules.v4
+  command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save || true
+fi
+EOF
+
   log "[BR-SRV -> HQ-SRV] Настройка RAID0, NFS, Apache+MariaDB, chrony..."
   if [ -d "$ISO_MOUNT/web" ]; then
-    scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 -P "$SSH_PORT_HQ_SRV" -r \
+    scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -P "$SSH_PORT_HQ_SRV" -r \
       "$ISO_MOUNT/web" "sshuser@${IP_HQ_SRV}:/tmp/web_src" || true
   fi
 
-  ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p "$SSH_PORT_HQ_SRV" "sshuser@${IP_HQ_SRV}" "sudo bash -s" <<EOF
+  ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p "$SSH_PORT_HQ_SRV" "sshuser@${IP_HQ_SRV}" "sudo bash -s" <<EOF
 set -euo pipefail
 
 CHRONY_CONF=/etc/chrony.conf
@@ -449,7 +549,7 @@ fi
 EOF
 
   log "[BR-SRV -> HQ-CLI] Ввод в домен, sudo hq, NFS, chrony, браузер..."
-  ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p 22 "sshuser@${IP_HQ_CLI}" "sudo bash -s" <<EOF
+  ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p 22 "sshuser@${IP_HQ_CLI}" "sudo bash -s" <<EOF
 set -euo pipefail
 
 CHRONY_CONF=/etc/chrony.conf
@@ -514,112 +614,12 @@ else
 fi
 EOF
 
-  log "[BR-SRV -> HQ-RTR] chrony + DNAT 8080/2027 + сохранение правил..."
-  ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p 22 "net_admin@${IP_HQ_RTR}" "sudo bash -s" <<EOF
-set -euo pipefail
-
-CHRONY_CONF=/etc/chrony.conf
-[ -f /etc/chrony/chrony.conf ] && CHRONY_CONF=/etc/chrony/chrony.conf
-cat > "\$CHRONY_CONF" <<CHR
-server $IP_ISP iburst
-driftfile /var/lib/chrony/drift
-makestep 1.0 3
-rtcsync
-CHR
-systemctl enable --now chronyd 2>/dev/null || systemctl enable --now chrony 2>/dev/null || true
-systemctl restart chronyd 2>/dev/null || systemctl restart chrony 2>/dev/null || true
-
-sysctl -w net.ipv4.ip_forward=1
-grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
-
-if command -v nft >/dev/null 2>&1; then
-  nft add table ip nat 2>/dev/null || true
-  nft add chain ip nat prerouting '{ type nat hook prerouting priority dstnat; policy accept; }' 2>/dev/null || true
-  nft add chain ip nat postrouting '{ type nat hook postrouting priority srcnat; policy accept; }' 2>/dev/null || true
-
-  nft list chain ip nat prerouting 2>/dev/null | grep -q 'dport 8080 dnat to $IP_HQ_SRV:80' || \
-    nft add rule ip nat prerouting iifname "$EXT_IF_HQ_RTR" tcp dport 8080 dnat to $IP_HQ_SRV:80
-
-  nft list chain ip nat prerouting 2>/dev/null | grep -q 'dport $SSH_PORT_HQ_SRV dnat to $IP_HQ_SRV:$SSH_PORT_HQ_SRV' || \
-    nft add rule ip nat prerouting iifname "$EXT_IF_HQ_RTR" tcp dport $SSH_PORT_HQ_SRV dnat to $IP_HQ_SRV:$SSH_PORT_HQ_SRV
-
-  nft list chain ip nat postrouting 2>/dev/null | grep -q 'masquerade' || \
-    nft add rule ip nat postrouting masquerade
-
-  nft list ruleset > /etc/nftables.conf
-  systemctl enable --now nftables 2>/dev/null || true
-else
-  iptables -t nat -C PREROUTING -i "$EXT_IF_HQ_RTR" -p tcp --dport 8080 -j DNAT --to-destination "$IP_HQ_SRV:80" 2>/dev/null || \
-    iptables -t nat -A PREROUTING -i "$EXT_IF_HQ_RTR" -p tcp --dport 8080 -j DNAT --to-destination "$IP_HQ_SRV:80"
-
-  iptables -t nat -C PREROUTING -i "$EXT_IF_HQ_RTR" -p tcp --dport "$SSH_PORT_HQ_SRV" -j DNAT --to-destination "$IP_HQ_SRV:$SSH_PORT_HQ_SRV" 2>/dev/null || \
-    iptables -t nat -A PREROUTING -i "$EXT_IF_HQ_RTR" -p tcp --dport "$SSH_PORT_HQ_SRV" -j DNAT --to-destination "$IP_HQ_SRV:$SSH_PORT_HQ_SRV"
-
-  iptables -t nat -C POSTROUTING -j MASQUERADE 2>/dev/null || \
-    iptables -t nat -A POSTROUTING -j MASQUERADE
-
-  mkdir -p /etc/iptables
-  iptables-save > /etc/iptables/rules.v4
-  command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save || true
-fi
-EOF
-
-  log "[BR-SRV -> BR-RTR] chrony + DNAT 8080/2027 + сохранение правил..."
-  ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p 22 "net_admin@${IP_BR_RTR}" "sudo bash -s" <<EOF
-set -euo pipefail
-
-CHRONY_CONF=/etc/chrony.conf
-[ -f /etc/chrony/chrony.conf ] && CHRONY_CONF=/etc/chrony/chrony.conf
-cat > "\$CHRONY_CONF" <<CHR
-server $IP_ISP iburst
-driftfile /var/lib/chrony/drift
-makestep 1.0 3
-rtcsync
-CHR
-systemctl enable --now chronyd 2>/dev/null || systemctl enable --now chrony 2>/dev/null || true
-systemctl restart chronyd 2>/dev/null || systemctl restart chrony 2>/dev/null || true
-
-sysctl -w net.ipv4.ip_forward=1
-grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
-
-if command -v nft >/dev/null 2>&1; then
-  nft add table ip nat 2>/dev/null || true
-  nft add chain ip nat prerouting '{ type nat hook prerouting priority dstnat; policy accept; }' 2>/dev/null || true
-  nft add chain ip nat postrouting '{ type nat hook postrouting priority srcnat; policy accept; }' 2>/dev/null || true
-
-  nft list chain ip nat prerouting 2>/dev/null | grep -q 'dport 8080 dnat to $IP_BR_SRV:8080' || \
-    nft add rule ip nat prerouting iifname "$EXT_IF_BR_RTR" tcp dport 8080 dnat to $IP_BR_SRV:8080
-
-  nft list chain ip nat prerouting 2>/dev/null | grep -q 'dport $SSH_PORT_BR_SRV dnat to $IP_BR_SRV:$SSH_PORT_BR_SRV' || \
-    nft add rule ip nat prerouting iifname "$EXT_IF_BR_RTR" tcp dport $SSH_PORT_BR_SRV dnat to $IP_BR_SRV:$SSH_PORT_BR_SRV
-
-  nft list chain ip nat postrouting 2>/dev/null | grep -q 'masquerade' || \
-    nft add rule ip nat postrouting masquerade
-
-  nft list ruleset > /etc/nftables.conf
-  systemctl enable --now nftables 2>/dev/null || true
-else
-  iptables -t nat -C PREROUTING -i "$EXT_IF_BR_RTR" -p tcp --dport 8080 -j DNAT --to-destination "$IP_BR_SRV:8080" 2>/dev/null || \
-    iptables -t nat -A PREROUTING -i "$EXT_IF_BR_RTR" -p tcp --dport 8080 -j DNAT --to-destination "$IP_BR_SRV:8080"
-
-  iptables -t nat -C PREROUTING -i "$EXT_IF_BR_RTR" -p tcp --dport "$SSH_PORT_BR_SRV" -j DNAT --to-destination "$IP_BR_SRV:$SSH_PORT_BR_SRV" 2>/dev/null || \
-    iptables -t nat -A PREROUTING -i "$EXT_IF_BR_RTR" -p tcp --dport "$SSH_PORT_BR_SRV" -j DNAT --to-destination "$IP_BR_SRV:$SSH_PORT_BR_SRV"
-
-  iptables -t nat -C POSTROUTING -j MASQUERADE 2>/dev/null || \
-    iptables -t nat -A POSTROUTING -j MASQUERADE
-
-  mkdir -p /etc/iptables
-  iptables-save > /etc/iptables/rules.v4
-  command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save || true
-fi
-EOF
-
   log "[BR-SRV] Проверка ansible targets -m ping..."
   ANSIBLE_STDOUT_CALLBACK=minimal ansible targets -m ping || true
 
   log "[FINAL] Очистка истории и перезагрузка всех машин (BR-SRV последним)..."
 
-  ssh -o StrictHostKeyChecking=no -p 22 "net_admin@${IP_ISP}" "sudo bash -s" <<'EOF' || true
+  ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p 22 "net_admin@${IP_ISP}" "sudo bash -s" <<'EOF' || true
 cat > /root/.bash_history <<'HIST'
 apt-get update
 apt-get install -y chrony
@@ -637,7 +637,7 @@ sync
 nohup reboot >/dev/null 2>&1 &
 EOF
 
-  ssh -o StrictHostKeyChecking=no -p "$SSH_PORT_HQ_SRV" "sshuser@${IP_HQ_SRV}" "sudo bash -s" <<'EOF' || true
+  ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p "$SSH_PORT_HQ_SRV" "sshuser@${IP_HQ_SRV}" "sudo bash -s" <<'EOF' || true
 cat > /root/.bash_history <<'HIST'
 apt-get install -y mdadm e2fsprogs
 mdadm --create /dev/md0 --level=0 --raid-devices=2 /dev/sdb /dev/sdc
@@ -669,7 +669,7 @@ sync
 nohup reboot >/dev/null 2>&1 &
 EOF
 
-  ssh -o StrictHostKeyChecking=no -p 22 "sshuser@${IP_HQ_CLI}" "sudo bash -s" <<'EOF' || true
+  ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p 22 "sshuser@${IP_HQ_CLI}" "sudo bash -s" <<'EOF' || true
 cat > /root/.bash_history <<'HIST'
 apt-get install -y realmd sssd sssd-ad adcli krb5-user
 realm discover HQ.LOCAL
@@ -694,7 +694,7 @@ sync
 nohup reboot >/dev/null 2>&1 &
 EOF
 
-  ssh -o StrictHostKeyChecking=no -p 22 "net_admin@${IP_HQ_RTR}" "sudo bash -s" <<'EOF' || true
+  ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p 22 "net_admin@${IP_HQ_RTR}" "sudo bash -s" <<'EOF' || true
 cat > /root/.bash_history <<'HIST'
 nano /etc/chrony.conf
 systemctl restart chrony
@@ -717,7 +717,7 @@ sync
 nohup reboot >/dev/null 2>&1 &
 EOF
 
-  ssh -o StrictHostKeyChecking=no -p 22 "net_admin@${IP_BR_RTR}" "sudo bash -s" <<'EOF' || true
+  ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p 22 "net_admin@${IP_BR_RTR}" "sudo bash -s" <<'EOF' || true
 cat > /root/.bash_history <<'HIST'
 nano /etc/chrony.conf
 systemctl restart chrony
