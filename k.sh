@@ -72,10 +72,9 @@ stage1_node_prepare_and_ssh() {
   apt-get update -y
   apt-get install -y \
     openssh-server \
-    openssh-client \
+    openssh-clients \
     sshpass \
     python3 \
-    python3-apt \
     sudo \
     curl \
     wget \
@@ -210,8 +209,8 @@ EOF
   fi
 
   log "[BR-SRV] Развёртывание Docker-стека testapp..."
-  apt-get install -y docker.io docker-compose-v2 ansible 2>/dev/null || \
-    apt-get install -y docker docker-compose ansible
+  apt-get install -y docker-engine docker-compose-v2 ansible 2>/dev/null || \
+    apt-get install -y docker-engine docker-compose ansible
   systemctl enable --now docker
 
   mkdir -p "$ISO_MOUNT"
@@ -355,7 +354,7 @@ mount -a || true
 
 mkdir -p "$NFS_EXPORT_DIR"
 chmod 0777 "$NFS_EXPORT_DIR"
-apt-get install -y nfs-kernel-server 2>/dev/null || apt-get install -y nfs-server
+apt-get install -y nfs-server 2>/dev/null || apt-get install -y nfs-kernel-server
 grep -q "^${NFS_EXPORT_DIR}[[:space:]]" /etc/exports || \
   echo "$NFS_EXPORT_DIR $HQ_CLI_NET(rw,sync,no_subtree_check,no_root_squash)" >> /etc/exports
 exportfs -ra
@@ -420,8 +419,8 @@ fi
 
 apt-get update -y
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  realmd sssd sssd-ad oddjob oddjob-mkhomedir adcli krb5-user \
-  samba-common-bin packagekit sudo nfs-common
+  realmd sssd sssd-ad sssd-tools oddjob oddjob-mkhomedir adcli krb5-user \
+  samba-common-tools packagekit sudo nfs-common
 
 realm discover "$AD_REALM" || true
 
@@ -596,11 +595,11 @@ mkfs.ext4 /dev/md0
 mkdir -p /raid
 echo "/dev/md0 /raid ext4 defaults,nofail 0 2" >> /etc/fstab
 mount -a
-apt-get install -y nfs-kernel-server
+apt-get install -y nfs-server
 mkdir -p /raid/nfs
 echo "/raid/nfs 192.168.10.0/24(rw,sync,no_subtree_check,no_root_squash)" >> /etc/exports
 exportfs -ra
-systemctl restart nfs-kernel-server
+systemctl restart nfs-server
 apt-get install -y apache2 mariadb-server php php-mysql
 mysql -e "CREATE DATABASE webdb;"
 mysql webdb < /tmp/web_src/dump.sql
@@ -698,7 +697,7 @@ samba-tool domain passwordsettings set --account-lockout-threshold=5
 samba-tool group add hq
 samba-tool user create hquser1 P@ssw0rd123
 samba-tool group addmembers hq hquser1
-apt-get install -y docker.io docker-compose-v2 ansible
+apt-get install -y docker-engine docker-compose-v2 ansible
 mount -o loop /root/Additional.iso /mnt/additional_iso
 docker load -i /mnt/additional_iso/docker/site_latest.tar
 docker load -i /mnt/additional_iso/docker/mariadb_latest.tar
