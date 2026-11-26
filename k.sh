@@ -1,943 +1,728 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-    echo "Ошибка запуска: используйте source <(curl -sL ...)"
-    return 1 2>/dev/null || exit 1
-fi
+ROLE="${ROLE:-auto}"
 
-m2_main() {
-    set -u
-    trap 'set +u' RETURN
+IP_ISP="172.16.1.1"
+IP_HQ_RTR="172.16.1.2"
+IP_BR_RTR="172.16.2.2"
+IP_HQ_SRV="192.168.10.2"
+IP_BR_SRV="192.168.20.2"
+IP_HQ_CLI="192.168.10.10"
 
-    if [ "$EUID" -ne 0 ]; then
-        echo "Нужны права root (sudo -i)"
-        return 1
+HQ_CLI_NET="192.168.10.0/24"
+EXT_IF_HQ_RTR="${EXT_IF_HQ_RTR:-eth0}"
+EXT_IF_BR_RTR="${EXT_IF_BR_RTR:-eth0}"
+
+SSH_PORT_HQ_SRV="2027"
+SSH_PORT_BR_SRV="2027"
+SSH_PASS="P@ssw0rd"
+AUTHORIZED_PUBKEY=""
+
+AD_REALM="HQ.LOCAL"
+AD_ADMIN_PASS="${AD_ADMIN_PASS:-$SSH_PASS}"
+HQ_GROUP="hq"
+HQ_USER_PASS="P@ssw0rd123"
+
+RAID_DEV="/dev/md0"
+RAID_DISKS=("/dev/sdb" "/dev/sdc")
+RAID_MOUNT="/raid"
+NFS_EXPORT_DIR="/raid/nfs"
+CLI_NFS_MOUNT="/mnt/nfs"
+
+UPSTREAM_NTP="pool.ntp.org"
+ISO_PATH="/root/Additional.iso"
+ISO_MOUNT="/mnt/additional_iso"
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --role) ROLE="${2:-auto}"; shift 2 ;;
+    --role=*) ROLE="${1#*=}"; shift ;;
+    *) shift ;;
+  esac
+done
+
+log() { printf '\n[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
+die() { printf '\n[ERROR] %s\n' "$*" >&2; exit 1; }
+
+[ "$(id -u)" -eq 0 ] || die "Запусти скрипт от имени root."
+
+detect_role() {
+  if [ "$ROLE" != "auto" ]; then
+    echo "$ROLE"
+    return 0
+  fi
+  local hn ips
+  hn="$(hostname -s 2>/dev/null || hostname)"
+  ips="$(hostname -I 2>/dev/null || true)"
+  if [[ "$hn" == *br-srv* ]] || [[ " $ips " == *" $IP_BR_SRV "* ]]; then
+    echo "br-srv"
+  else
+    echo "node"
+  fi
+}
+
+stage1_node_prepare_and_ssh() {
+  local hn ips ssh_user target_port sshd_cfg
+  hn="$(hostname -s 2>/dev/null || hostname)"
+  ips="$(hostname -I 2>/dev/null || true)"
+
+  log "[ЭТАП 1][$hn] Проверка и установка базовых пакетов..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y \
+    openssh-server \
+    openssh-client \
+    sshpass \
+    python3 \
+    python3-apt \
+    sudo \
+    curl \
+    wget \
+    ca-certificates \
+    chrony \
+    nftables \
+    iptables \
+    iproute2 \
+    util-linux
+
+  if [[ "$hn" == *isp* ]] || [[ "$hn" == *rtr* ]] || \
+     [[ " $ips " == *" $IP_ISP "* ]] || \
+     [[ " $ips " == *" $IP_HQ_RTR "* ]] || \
+     [[ " $ips " == *" $IP_BR_RTR "* ]]; then
+    ssh_user="net_admin"
+  else
+    ssh_user="sshuser"
+  fi
+
+  if [[ "$hn" == *hq-srv* ]] || [[ " $ips " == *" $IP_HQ_SRV "* ]]; then
+    target_port="$SSH_PORT_HQ_SRV"
+  elif [[ "$hn" == *br-srv* ]] || [[ " $ips " == *" $IP_BR_SRV "* ]]; then
+    target_port="$SSH_PORT_BR_SRV"
+  else
+    target_port="22"
+  fi
+
+  log "[ЭТАП 1][$hn] Проверка пользователя SSH '$ssh_user'..."
+  if ! id "$ssh_user" >/dev/null 2>&1; then
+    useradd -m -s /bin/bash "$ssh_user"
+  fi
+  echo "${ssh_user}:${SSH_PASS}" | chpasswd
+
+  if getent group wheel >/dev/null 2>&1; then
+    usermod -aG wheel "$ssh_user" 2>/dev/null || true
+    printf '%%wheel ALL=(ALL:ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/90-wheel-nopasswd
+    chmod 0440 /etc/sudoers.d/90-wheel-nopasswd
+    visudo -cf /etc/sudoers.d/90-wheel-nopasswd
+  fi
+  if getent group sudo >/dev/null 2>&1; then
+    usermod -aG sudo "$ssh_user" 2>/dev/null || true
+  fi
+  printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$ssh_user" > "/etc/sudoers.d/90-${ssh_user}-nopasswd"
+  chmod 0440 "/etc/sudoers.d/90-${ssh_user}-nopasswd"
+  visudo -cf "/etc/sudoers.d/90-${ssh_user}-nopasswd"
+
+  mkdir -p /root/.ssh
+  chmod 700 /root/.ssh
+  touch /root/.ssh/authorized_keys
+  chmod 600 /root/.ssh/authorized_keys
+  if [ ! -f /root/.ssh/id_ed25519 ]; then
+    ssh-keygen -t ed25519 -N "" -f /root/.ssh/id_ed25519
+  fi
+  if [ -n "$AUTHORIZED_PUBKEY" ]; then
+    grep -qxF "$AUTHORIZED_PUBKEY" /root/.ssh/authorized_keys || \
+      echo "$AUTHORIZED_PUBKEY" >> /root/.ssh/authorized_keys
+  fi
+
+  local uhome
+  uhome="$(getent passwd "$ssh_user" | cut -d: -f6)"
+  mkdir -p "$uhome/.ssh"
+  chmod 700 "$uhome/.ssh"
+  touch "$uhome/.ssh/authorized_keys"
+  chmod 600 "$uhome/.ssh/authorized_keys"
+  if [ -n "$AUTHORIZED_PUBKEY" ]; then
+    grep -qxF "$AUTHORIZED_PUBKEY" "$uhome/.ssh/authorized_keys" || \
+      echo "$AUTHORIZED_PUBKEY" >> "$uhome/.ssh/authorized_keys"
+  fi
+  chown -R "${ssh_user}:${ssh_user}" "$uhome/.ssh"
+
+  log "[ЭТАП 1][$hn] Настройка sshd, порт ${target_port}..."
+  sshd_cfg="/etc/openssh/sshd_config"
+  [ -f "$sshd_cfg" ] || sshd_cfg="/etc/ssh/sshd_config"
+  [ -f "$sshd_cfg" ] || die "Файл конфигурации sshd_config не найден"
+
+  sed -i 's/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/' "$sshd_cfg"
+  sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' "$sshd_cfg"
+
+  if ! grep -Eq "^[[:space:]]*Port[[:space:]]+${target_port}\b" "$sshd_cfg"; then
+    if grep -Eq "^[[:space:]]*#?[[:space:]]*Port[[:space:]]+" "$sshd_cfg"; then
+      sed -i "s/^[[:space:]]*#*[[:space:]]*Port[[:space:]].*/Port ${target_port}/" "$sshd_cfg"
+    else
+      echo "Port ${target_port}" >> "$sshd_cfg"
     fi
+  fi
 
-    local DOMAIN_REALM="AU-TEAM.IRPO"
-    local DOMAIN_NAME="au-team.irpo"
-    local WORKGROUP_NAME="AU-TEAM"
-    local SSH_PORT_DEFAULT="2027"
-    local NTP_UPSTREAM="pool.ntp.org"
-    local ISO_MOUNT="/mnt/iso"
+  sshd -t -f "$sshd_cfg"
 
-    local HQ_RTR_IP="172.16.1.2"
-    local BR_RTR_IP="172.16.2.2"
-    local HQ_SRV_IP="192.168.100.2"
-    local BR_SRV_IP="192.168.0.2"
-    local HQ_CLI_NET="192.168.200.0/28"
-    local HQ_CLI_IP_FALLBACK="192.168.200.2"
-    local ISP_NTP_DEFAULT="172.16.1.1"
-    local ISP_IP_DEFAULT="172.16.1.1"
+  systemctl enable --now sshd 2>/dev/null || systemctl enable --now ssh 2>/dev/null || true
+  systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
 
-    m2_hist() {
-        history -s "$1" 2>/dev/null || true
-        echo "$1" >> "$HOME/.bash_history"
-    }
+  if command -v ss >/dev/null 2>&1; then
+    ss -tlnp | grep -E ":${target_port}\b" || true
+  fi
+  id "$ssh_user"
+  sudo -l -U "$ssh_user" >/dev/null 2>&1 || true
+  log "[ЭТАП 1][$hn] Готово (пользователь: $ssh_user, порт: $target_port)."
+}
 
-    m2_run() {
-        eval "$1"
-        m2_hist "$1"
-    }
+stage2_br_srv_workflow() {
+  log "[ЭТАП 2][BR-SRV] Локальные задачи BR-SRV..."
 
-    m2_ask() {
-        local p="$1" d="$2" v
-        read -r -p "$p [$d]: " v
-        echo "${v:-$d}"
-    }
-
-    m2_ask_secret() {
-        local p="$1" d="$2" v
-        read -r -s -p "$p [$d]: " v
-        echo ""
-        echo "${v:-$d}"
-    }
-
-    m2_ask_yn() {
-        local p="$1" d="$2" v
-        while true; do
-            read -r -p "$p [$d]: " v
-            v="${v:-$d}"
-            case "${v,,}" in
-                д|да|y|yes) echo "y"; return 0 ;;
-                н|нет|n|no) echo "n"; return 0 ;;
-            esac
-        done
-    }
-
-    m2_pkg_installed() {
-        local pkg="$1"
-        if command -v rpm >/dev/null 2>&1; then
-            if rpm -q "$pkg" >/dev/null 2>&1; then
-                return 0
-            fi
-            if rpm -q --whatprovides "$pkg" >/dev/null 2>&1; then
-                return 0
-            fi
-        fi
-        if command -v dpkg >/dev/null 2>&1; then
-            if dpkg -s "$pkg" >/dev/null 2>&1; then
-                return 0
-            fi
-        fi
-        return 1
-    }
-
-    m2_detect_role() {
-        local hn
-        hn="$(hostname -s 2>/dev/null || hostname)"
-        case "${hn,,}" in
-            *isp*)    echo "ISP" ;;
-            *hq-rtr*) echo "HQ-RTR" ;;
-            *br-rtr*) echo "BR-RTR" ;;
-            *br-fw*)  echo "BR-FW" ;;
-            *hq-srv*) echo "HQ-SRV" ;;
-            *br-srv*) echo "BR-SRV" ;;
-            *hq-cli*) echo "HQ-CLI" ;;
-            *)        echo "" ;;
-        esac
-    }
-
-    m2_select_and_confirm_role() {
-        local cur_hn det_role chosen_role
-        cur_hn="$(hostname 2>/dev/null || echo unknown)"
-        det_role="$(m2_detect_role)"
-
-        echo "=========================================="
-        echo "Текущий hostname: $cur_hn"
-        if [ -n "$det_role" ]; then
-            echo "Автоопределённая роль: $det_role"
-            chosen_role="$(m2_ask "Подтвердите или укажите роль машины (ISP, HQ-RTR, BR-RTR, BR-FW, HQ-SRV, BR-SRV, HQ-CLI)" "$det_role")"
-        else
-            echo "Автоопределить роль по hostname не удалось."
-            select chosen_role in ISP HQ-RTR BR-RTR BR-FW HQ-SRV BR-SRV HQ-CLI; do
-                [ -n "$chosen_role" ] && break
-            done
-        fi
-        chosen_role="${chosen_role^^}"
-        echo "Выбрана машина / роль: $chosen_role (hostname: $cur_hn)"
-        echo "=========================================="
-        echo "$chosen_role"
-    }
-
-    m2_role_pkg_list() {
-        local role="$1"
-        case "$role" in
-            ISP)
-                echo "chrony nginx openssl iptables openssh-server"
-                ;;
-            HQ-RTR|BR-RTR)
-                echo "chrony iptables openssh-server"
-                ;;
-            HQ-SRV)
-                echo "chrony mdadm nfs-server nfs-utils rpcbind apache2 apache2-mod_php8.3 php8.3-mysqlnd-mysqli mariadb-server openssh-server"
-                ;;
-            BR-SRV)
-                echo "chrony sshpass ansible docker-engine docker-compose-v2 task-samba-dc openssh-server"
-                ;;
-            HQ-CLI)
-                echo "chrony nfs-utils nfs-clients rpcbind task-auth-ad-sssd openssh-server"
-                ;;
-            *)
-                echo "chrony openssh-server"
-                ;;
-        esac
-    }
-
-    m2_ensure_packages() {
-        local role="$1"
-        local req_pkgs already="" missing="" pkg
-        req_pkgs="$(m2_role_pkg_list "$role")"
-
-        for pkg in $req_pkgs; do
-            if m2_pkg_installed "$pkg"; then
-                already="$already $pkg"
-            else
-                missing="$missing $pkg"
-            fi
-        done
-
-        if [ "$role" = "HQ-CLI" ]; then
-            if m2_pkg_installed "yandex-browser-stable" || m2_pkg_installed "yandex-browser"; then
-                already="$already yandex-browser"
-            else
-                missing="$missing yandex-browser-stable"
-            fi
-        fi
-
-        [ -n "$already" ] && echo "[$role] Уже установлены:$already"
-        if [ -z "$missing" ]; then
-            echo "[$role] Все требуемые пакеты уже на месте, докачка не требуется."
-            return 0
-        fi
-
-        echo "[$role] Недостающие пакеты:$missing"
-        if command -v apt-get >/dev/null 2>&1; then
-            m2_run "apt-get update"
-            local m
-            for m in $missing; do
-                if [ "$m" = "yandex-browser-stable" ]; then
-                    if apt-cache show yandex-browser-stable >/dev/null 2>&1; then
-                        m2_run "apt-get install -y yandex-browser-stable"
-                    elif apt-cache show yandex-browser >/dev/null 2>&1; then
-                        m2_run "apt-get install -y yandex-browser"
-                    else
-                        echo "Пакет Яндекс Браузера не найден в apt."
-                    fi
-                else
-                    apt-get install -y "$m" && m2_hist "apt-get install -y $m" || echo "Не удалось поставить $m"
-                fi
-            done
-        elif command -v apt-repo >/dev/null 2>&1 || command -v apt >/dev/null 2>&1; then
-            m2_run "apt-get update"
-            local m
-            for m in $missing; do
-                apt-get install -y "$m" && m2_hist "apt-get install -y $m" || echo "Не удалось поставить $m"
-            done
-        fi
-    }
-
-    m2_fast_ssh_only() {
-        local role="$1"
-        local def_user="sshuser"
-        case "$role" in
-            HQ-RTR|BR-RTR) def_user="net_admin" ;;
-        esac
-
-        if ! id "$def_user" >/dev/null 2>&1; then
-            useradd -m -s /bin/bash "$def_user" 2>/dev/null || true
-            echo "${def_user}:P@ssw0rd" | chpasswd 2>/dev/null || true
-            m2_hist "useradd -m -s /bin/bash $def_user"
-        fi
-
-        mkdir -p "/home/${def_user}/.ssh"
-        chmod 0700 "/home/${def_user}/.ssh"
-        touch "/home/${def_user}/.ssh/authorized_keys"
-        chmod 0600 "/home/${def_user}/.ssh/authorized_keys"
-        chown -R "${def_user}:${def_user}" "/home/${def_user}/.ssh"
-
-        cat > "/etc/sudoers.d/90-ansible-${def_user}" <<EOF
-${def_user} ALL=(ALL) NOPASSWD: ALL
-EOF
-        chmod 0440 "/etc/sudoers.d/90-ansible-${def_user}"
-
-        if [ -f /etc/ssh/sshd_config ]; then
-            if grep -qE "^#?AllowUsers[[:space:]]+" /etc/ssh/sshd_config; then
-                if ! grep -qE "^#?AllowUsers[[:space:]]+.*\b${def_user}\b" /etc/ssh/sshd_config; then
-                    sed -i -E "s/^(#?AllowUsers[[:space:]]+.*)/\1 ${def_user}/" /etc/ssh/sshd_config
-                fi
-            else
-                echo "AllowUsers ${def_user} root" >> /etc/ssh/sshd_config
-            fi
-        fi
-
-        if systemctl list-unit-files 2>/dev/null | grep -q '^sshd\.service'; then
-            systemctl enable --now sshd 2>/dev/null || true
-            systemctl restart sshd 2>/dev/null || true
-        else
-            systemctl enable --now ssh 2>/dev/null || true
-            systemctl restart ssh 2>/dev/null || true
-        fi
-
-        echo "[$role] Пакеты проверены, SSH активен, пользователь $def_user готов."
-    }
-
-    m2_mount_iso() {
-        mkdir -p "$ISO_MOUNT"
-        if mountpoint -q "$ISO_MOUNT" 2>/dev/null; then
-            return 0
-        fi
-        local dev
-        for dev in /dev/sr0 /dev/sr1 /dev/cdrom; do
-            if [ -b "$dev" ] && mount -o ro "$dev" "$ISO_MOUNT" 2>/dev/null; then
-                m2_hist "mount -o ro $dev $ISO_MOUNT"
-                return 0
-            fi
-        done
-        return 1
-    }
-
-    m2_step1_samba_ad() {
-        local role="$1"
-        if [ "$role" = "BR-SRV" ]; then
-            local admin_pass user_pass fwd_ip
-            admin_pass="$(m2_ask_secret "Пароль Администратора домена" "P@ssw0rd")"
-            user_pass="$(m2_ask_secret "Пароль для hquser1..5" "P@ssw0rd")"
-            fwd_ip="$(m2_ask "DNS forwarder для Samba DC" "$HQ_SRV_IP")"
-
-            if ! systemctl is-active --quiet samba 2>/dev/null; then
-                if [ -z "$(awk '/^nameserver/{print $2}' /etc/resolv.conf 2>/dev/null)" ]; then
-                    echo "nameserver $fwd_ip" > /etc/resolv.conf
-                    m2_hist "nano /etc/resolv.conf"
-                fi
-                systemctl stop samba 2>/dev/null || true
-                rm -f /etc/samba/smb.conf
-                rm -rf /var/lib/samba/* /var/cache/samba/*
-                mkdir -p /var/lib/samba/sysvol
-                hostnamectl set-hostname "br-srv.${DOMAIN_NAME}" 2>/dev/null || true
-                m2_hist "hostnamectl set-hostname br-srv.${DOMAIN_NAME}"
-
-                samba-tool domain provision \
-                    --use-rfc2307 \
-                    --realm="$DOMAIN_REALM" \
-                    --domain="$WORKGROUP_NAME" \
-                    --server-role=dc \
-                    --dns-backend=SAMBA_INTERNAL \
-                    --option="dns forwarder = ${fwd_ip}" \
-                    --adminpass="$admin_pass"
-                m2_hist "samba-tool domain provision --use-rfc2307 --realm=${DOMAIN_REALM} --domain=${WORKGROUP_NAME} --server-role=dc --dns-backend=SAMBA_INTERNAL --option=\"dns forwarder = ${fwd_ip}\""
-
-                if [ -f /var/lib/samba/private/krb5.conf ]; then
-                    \cp -f /var/lib/samba/private/krb5.conf /etc/krb5.conf
-                    m2_hist "cp -f /var/lib/samba/private/krb5.conf /etc/krb5.conf"
-                fi
-                echo "nameserver 127.0.0.1" > /etc/resolv.conf
-                m2_hist "nano /etc/resolv.conf"
-                m2_run "systemctl enable --now samba"
-            fi
-
-            samba-tool domain passwordsettings set \
-                --min-pwd-length=8 \
-                --account-lockout-threshold=5 \
-                --account-lockout-duration=30 \
-                --reset-account-lockout-after=30 2>/dev/null || true
-            m2_hist "samba-tool domain passwordsettings set --min-pwd-length=8 --account-lockout-threshold=5 --account-lockout-duration=30 --reset-account-lockout-after=30"
-
-            samba-tool group add hq 2>/dev/null || true
-            m2_hist "samba-tool group add hq"
-            local i uname
-            for i in 1 2 3 4 5; do
-                uname="hquser${i}"
-                samba-tool user create "$uname" "$user_pass" 2>/dev/null || true
-                m2_hist "samba-tool user create $uname"
-                samba-tool group addmembers hq "$uname" 2>/dev/null || true
-                m2_hist "samba-tool group addmembers hq $uname"
-            done
-        elif [ "$role" = "HQ-CLI" ]; then
-            local admin_pass
-            admin_pass="$(m2_ask_secret "Пароль Администратора домена" "P@ssw0rd")"
-
-            if command -v system-auth >/dev/null 2>&1; then
-                system-auth write ad "$DOMAIN_NAME" "hq-cli" "$WORKGROUP_NAME" Administrator "$admin_pass" 2>/dev/null || true
-                m2_hist "system-auth write ad ${DOMAIN_NAME} hq-cli ${WORKGROUP_NAME} Administrator"
-            elif command -v net >/dev/null 2>&1; then
-                net ads join -U "Administrator%${admin_pass}" 2>/dev/null || true
-                net ads testjoin 2>/dev/null || true
-                m2_hist "net ads testjoin"
-            fi
-
-            control sudo public 2>/dev/null || true
-            m2_hist "control sudo public"
-            local gid_num
-            gid_num="$(getent group hq 2>/dev/null | awk -F: '{print $3}')"
-            if [ -z "$gid_num" ]; then
-                gid_num="$(id hquser1 2>/dev/null | sed -n 's/.*gid=\([0-9]\+\).*/\1/p')"
-            fi
-            if [ -n "$gid_num" ]; then
-                cat > /etc/sudoers.d/hq_group <<EOF
-%#${gid_num} ALL=(root) /usr/bin/cat, /usr/bin/grep, /usr/bin/id
-EOF
-            else
-                cat > /etc/sudoers.d/hq_group <<EOF
-%hq ALL=(root) /usr/bin/cat, /usr/bin/grep, /usr/bin/id
-EOF
-            fi
-            chmod 0440 /etc/sudoers.d/hq_group
-            m2_hist "visudo"
-            visudo -c 2>/dev/null && m2_hist "visudo -c" || true
-        fi
-    }
-
-    m2_step2_raid() {
-        local root_disk disks
-        root_disk="$(lsblk -ndo pkname "$(findmnt -n -o SOURCE / 2>/dev/null)" 2>/dev/null | head -n1)"
-        disks="$(lsblk -dn -o NAME,TYPE 2>/dev/null | awk -v r="$root_disk" '$2=="disk" && $1!=r && $1!~/^loop|^sr|^md/ {print "/dev/"$1}')"
-
-        echo "Доступные свободные диски:"
-        echo "${disks:-  (не найдено)}"
-
-        local raid_level min_disks dev_count chosen_disks d
-        raid_level="$(m2_ask "Уровень RAID (0, 1, 3, 4, 5, 6, 10)" "0")"
-
-        case "$raid_level" in
-            0|1|3) min_disks=2 ;;
-            4|5)   min_disks=3 ;;
-            6|10)  min_disks=4 ;;
-            *)
-                echo "Неподдерживаемый уровень RAID: $raid_level"
-                return 1
-                ;;
-        esac
-
-        local avail_count
-        avail_count="$(echo "$disks" | sed '/^$/d' | wc -l)"
-        if [ "$avail_count" -lt "$min_disks" ]; then
-            echo "Для RAID $raid_level нужно минимум $min_disks свободных дисков, найдено: $avail_count."
-            return 1
-        fi
-
-        local def_count="$min_disks"
-        if [ "$raid_level" = "0" ] && [ "$avail_count" -ge 2 ]; then
-            def_count=2
-        fi
-        dev_count="$(m2_ask "Сколько дисков включить в RAID $raid_level" "$def_count")"
-
-        chosen_disks="$(echo "$disks" | sed '/^$/d' | head -n "$dev_count" | tr '\n' ' ')"
-        if [ -z "$chosen_disks" ]; then
-            echo "Не удалось выбрать диски для RAID."
-            return 1
-        fi
-
-        echo "Создаётся RAID $raid_level (/dev/md0) на дисках: $chosen_disks"
-        for d in $chosen_disks; do
-            mdadm --zero-superblock --force "$d" 2>/dev/null || true
-            m2_hist "mdadm --zero-superblock --force $d"
-            wipefs --all --force "$d" 2>/dev/null || true
-            m2_hist "wipefs --all --force $d"
-        done
-
-        if [ ! -e /dev/md0 ]; then
-            m2_run "mdadm --create /dev/md0 --level=${raid_level} --raid-devices=${dev_count} ${chosen_disks} --run"
-        fi
-
-        mkfs -t ext4 -F /dev/md0 2>/dev/null || true
-        m2_hist "mkfs -t ext4 /dev/md0"
-        mkdir -p /etc/mdadm /raid
-        echo "DEVICE partitions" > /etc/mdadm/mdadm.conf
-        mdadm --detail --scan 2>/dev/null | awk '/ARRAY/ {print}' >> /etc/mdadm/mdadm.conf
-        m2_hist "nano /etc/mdadm/mdadm.conf"
-
-        if ! grep -q '[[:space:]]/raid[[:space:]]' /etc/fstab 2>/dev/null; then
-            echo "/dev/md0 /raid ext4 defaults 0 0" >> /etc/fstab
-            m2_hist "nano /etc/fstab"
-        fi
-        m2_run "mount -a"
-        m2_hist "df -h /raid"
-        cat /proc/mdstat 2>/dev/null || true
-    }
-
-    m2_step3_nfs() {
-        local role="$1"
-        if [ "$role" = "HQ-SRV" ]; then
-            mkdir -p /raid/nfs
-            chmod 0777 /raid/nfs
-            m2_hist "mkdir -p /raid/nfs && chmod 0777 /raid/nfs"
-            if ! grep -q "^/raid/nfs[[:space:]]" /etc/exports 2>/dev/null; then
-                echo "/raid/nfs ${HQ_CLI_NET}(rw,no_root_squash,sync)" >> /etc/exports
-                m2_hist "nano /etc/exports"
-            fi
-            m2_run "exportfs -arv"
-            m2_run "systemctl enable --now nfs-server"
-        elif [ "$role" = "HQ-CLI" ]; then
-            mkdir -p /mnt/nfs
-            chmod 0777 /mnt/nfs
-            m2_hist "mkdir -p /mnt/nfs && chmod 0777 /mnt/nfs"
-            if ! grep -q "[[:space:]]/mnt/nfs[[:space:]]" /etc/fstab 2>/dev/null; then
-                echo "${HQ_SRV_IP}:/raid/nfs /mnt/nfs nfs defaults 0 0" >> /etc/fstab
-                m2_hist "nano /etc/fstab"
-            fi
-            m2_run "mount -a"
-            m2_hist "df -h /mnt/nfs"
-        fi
-    }
-
-    m2_step4_chrony() {
-        local role="$1"
-        if [ "$role" = "ISP" ]; then
-            cat > /etc/chrony.conf <<EOF
-pool $NTP_UPSTREAM iburst
-server 127.0.0.1 iburst prefer
-driftfile /var/lib/chrony/drift
-makestep 1.0 3
-rtcsync
-allow 0/0
-local stratum 5
-EOF
-        else
-            local ntp_srv
-            ntp_srv="$(m2_ask "IP сервера времени (ISP)" "$ISP_NTP_DEFAULT")"
-            cat > /etc/chrony.conf <<EOF
-server ${ntp_srv} iburst prefer
+  log "[BR-SRV] Настройка chrony-клиента на ISP..."
+  local chrony_conf="/etc/chrony.conf"
+  [ -f /etc/chrony/chrony.conf ] && chrony_conf="/etc/chrony/chrony.conf"
+  cat > "$chrony_conf" <<EOF
+server $IP_ISP iburst
 driftfile /var/lib/chrony/drift
 makestep 1.0 3
 rtcsync
 EOF
-        fi
-        m2_hist "nano /etc/chrony.conf"
-        m2_run "systemctl enable --now chronyd"
-        m2_run "systemctl restart chronyd"
-        m2_hist "chronyc sources"
-    }
+  systemctl enable --now chronyd 2>/dev/null || systemctl enable --now chrony 2>/dev/null || true
+  systemctl restart chronyd 2>/dev/null || systemctl restart chrony 2>/dev/null || true
 
-    m2_check_ssh_and_ansible_host() {
-        local host_alias="$1" ip="$2" u="$3" p="$4" pass="$5"
-        local ping_ok="НЕТ" tcp_ok="НЕТ" copy_ok="НЕТ" ansible_ok="НЕТ"
+  log "[BR-SRV] Настройка Samba DC..."
+  if command -v samba-tool >/dev/null 2>&1; then
+    samba-tool domain passwordsettings set --min-pwd-length=8 || true
+    samba-tool domain passwordsettings set --account-lockout-threshold=5 || true
+    samba-tool group add "$HQ_GROUP" 2>/dev/null || true
 
-        echo "--- Проверка $host_alias ($u@$ip:$p) ---"
-        if ping -c 1 -W 2 "$ip" >/dev/null 2>&1; then
-            ping_ok="ОК"
-            echo "  [1] Пинг до $ip: ОК"
-        else
-            echo "  [1] Пинг до $ip: ОШИБКА (хост не отвечает на ping)"
-        fi
+    for i in 1 2 3 4 5; do
+      uname="hquser${i}"
+      samba-tool user create "$uname" "$HQ_USER_PASS" \
+        --given-name="HQ" \
+        --surname="User${i}" \
+        --must-change-at-next-login=no 2>/dev/null || \
+        samba-tool user setpassword "$uname" --newpassword="$HQ_USER_PASS" 2>/dev/null || true
+      samba-tool group addmembers "$HQ_GROUP" "$uname" 2>/dev/null || true
+    done
+  else
+    log "[BR-SRV][WARN] samba-tool не найден."
+  fi
 
-        if timeout 3 bash -c "</dev/tcp/${ip}/${p}" 2>/dev/null; then
-            tcp_ok="ОК"
-            echo "  [2] Порт SSH $p на $ip: ОТКРЫТ"
-        else
-            echo "  [2] Порт SSH $p на $ip: ЗАКРЫТ / НЕДОСТУПЕН"
-        fi
+  log "[BR-SRV] Развёртывание Docker-стека testapp..."
+  apt-get install -y docker.io docker-compose-v2 ansible 2>/dev/null || \
+    apt-get install -y docker docker-compose ansible
+  systemctl enable --now docker
 
-        if [ "$tcp_ok" = "ОК" ]; then
-            if command -v sshpass >/dev/null 2>&1; then
-                if sshpass -p "$pass" ssh-copy-id -o StrictHostKeyChecking=no -o ConnectTimeout=5 -p "$p" -i /root/.ssh/ansible.pub "${u}@${ip}" >/dev/null 2>&1; then
-                    copy_ok="ОК"
-                    m2_hist "ssh-copy-id -i /root/.ssh/ansible.pub -p $p ${u}@${ip}"
-                    echo "  [3] Копирование ключа и вход по SSH: ОК"
-                else
-                    echo "  [3] Копирование ключа и вход по SSH: ОШИБКА (проверьте пользователя AllowUsers, пароль или доступ root/sudo)"
-                fi
-            else
-                echo "  [3] Копирование ключа: пропущено (нет sshpass)"
-            fi
-        else
-            echo "  [3] Копирование ключа: пропущено (нет TCP-соединения с $ip:$p)"
-        fi
+  mkdir -p "$ISO_MOUNT"
+  if [ -f "$ISO_PATH" ] && ! mountpoint -q "$ISO_MOUNT"; then
+    mount -o loop "$ISO_PATH" "$ISO_MOUNT" || true
+  fi
 
-        if [ "$copy_ok" = "ОК" ] && [ -f /etc/ansible/hosts ]; then
-            if (cd /etc/ansible && ansible "$host_alias" -m ping >/dev/null 2>&1); then
-                ansible_ok="ОК"
-                echo "  [4] Пригодность для Ansible ($host_alias): ГОТОВ"
-            else
-                echo "  [4] Пригодность для Ansible ($host_alias): НЕ ГОТОВ (проверьте python3 и права sudo на удалённом узле)"
-            fi
-        else
-            echo "  [4] Пригодность для Ansible ($host_alias): НЕ ГОТОВ"
-        fi
+  if [ -d "$ISO_MOUNT/docker" ]; then
+    for img in site_latest.tar mariadb_latest.tar; do
+      [ -f "$ISO_MOUNT/docker/$img" ] && docker load -i "$ISO_MOUNT/docker/$img" || true
+    done
 
-        echo "  Итог [$host_alias]: ping=$ping_ok | ssh_tcp=$tcp_ok | key_auth=$copy_ok | ansible=$ansible_ok"
-    }
+    mkdir -p /opt/testapp
+    cp -r "$ISO_MOUNT/docker/"* /opt/testapp/ 2>/dev/null || true
+    cd /opt/testapp
 
-    m2_ssh_push_target() {
-        local alias_name="$1" label="$2" def_ip="$3" def_user="$4" def_port="$5"
-        local ip u p pass
-        ip="$(m2_ask "$label: IP-адрес" "$def_ip")"
-        u="$(m2_ask "$label: пользователь (AllowUsers)" "$def_user")"
-        p="$(m2_ask "$label: порт SSH" "$def_port")"
-        pass="$(m2_ask_secret "$label ($u@$ip:$p): пароль для sshpass" "P@ssw0rd")"
+    if [ -f compose.yaml ]; then
+      if command -v docker-compose >/dev/null 2>&1; then
+        docker-compose -f compose.yaml up -d
+      else
+        docker compose -f compose.yaml up -d
+      fi
+    fi
+    cd /root
+    docker ps || true
+  else
+    log "[BR-SRV][WARN] Не найден $ISO_MOUNT/docker."
+  fi
 
-        if [ -f /etc/ansible/hosts ]; then
-            sed -i "/^[[:space:]]*${alias_name}[[:space:]]/d" /etc/ansible/hosts
-            echo "${alias_name} ansible_host=${ip} ansible_user=${u} ansible_port=${p}" >> /etc/ansible/hosts
-        fi
-
-        m2_check_ssh_and_ansible_host "$alias_name" "$ip" "$u" "$p" "$pass"
-        echo "${ip}|${u}|${p}"
-    }
-
-    m2_step5_ansible() {
-        if [ ! -f /root/.ssh/ansible ]; then
-            mkdir -p /root/.ssh
-            chmod 0700 /root/.ssh
-            ssh-keygen -t ed25519 -f /root/.ssh/ansible -N ""
-            m2_hist "ssh-keygen -t ed25519 -f /root/.ssh/ansible -N \"\""
-        fi
-
-        mkdir -p /etc/ansible
-        cat > /etc/ansible/ansible.cfg <<EOF
+  log "[BR-SRV] Формирование /etc/ansible..."
+  mkdir -p /etc/ansible
+  cat > /etc/ansible/ansible.cfg <<'EOF'
 [defaults]
 inventory = /etc/ansible/hosts
 host_key_checking = False
 interpreter_python = /usr/bin/python3
-EOF
-        m2_hist "nano /etc/ansible/ansible.cfg"
-
-        cat > /etc/ansible/hosts <<EOF
-[servers]
-hq-srv ansible_host=${HQ_SRV_IP} ansible_user=sshuser ansible_port=${SSH_PORT_DEFAULT}
-
-[clients]
-hq-cli ansible_host=${HQ_CLI_IP_FALLBACK} ansible_user=sshuser ansible_port=22
-
-[routers]
-hq-rtr ansible_host=${HQ_RTR_IP} ansible_user=net_admin ansible_port=22
-br-rtr ansible_host=${BR_RTR_IP} ansible_user=net_admin ansible_port=22
-
-[all:vars]
-ansible_python_interpreter=/usr/bin/python3
-ansible_ssh_private_key_file=/root/.ssh/ansible
+deprecation_warnings = False
+localhost_warning = False
 EOF
 
-        local hq_srv_cfg hq_cli_cfg hq_rtr_cfg br_rtr_cfg
-        local hq_srv_ip hq_srv_u hq_srv_p
-        local hq_cli_ip hq_cli_u hq_cli_p
-        local hq_rtr_ip hq_rtr_u hq_rtr_p
-        local br_rtr_ip br_rtr_u br_rtr_p
+  cat > /etc/ansible/hosts <<EOF
+[hq_srv]
+hq-srv ansible_host=$IP_HQ_SRV ansible_user=sshuser ansible_port=$SSH_PORT_HQ_SRV ansible_become=true ansible_become_method=sudo
 
-        hq_srv_cfg="$(m2_ssh_push_target "hq-srv" "HQ-SRV" "$HQ_SRV_IP" "sshuser" "$SSH_PORT_DEFAULT")"
-        hq_cli_cfg="$(m2_ssh_push_target "hq-cli" "HQ-CLI" "$HQ_CLI_IP_FALLBACK" "sshuser" "22")"
-        hq_rtr_cfg="$(m2_ssh_push_target "hq-rtr" "HQ-RTR" "$HQ_RTR_IP" "net_admin" "22")"
-        br_rtr_cfg="$(m2_ssh_push_target "br-rtr" "BR-RTR" "$BR_RTR_IP" "net_admin" "22")"
+[hq_cli]
+hq-cli ansible_host=$IP_HQ_CLI ansible_user=sshuser ansible_port=22 ansible_become=true ansible_become_method=sudo
 
-        IFS='|' read -r hq_srv_ip hq_srv_u hq_srv_p <<< "$hq_srv_cfg"
-        IFS='|' read -r hq_cli_ip hq_cli_u hq_cli_p <<< "$hq_cli_cfg"
-        IFS='|' read -r hq_rtr_ip hq_rtr_u hq_rtr_p <<< "$hq_rtr_cfg"
-        IFS='|' read -r br_rtr_ip br_rtr_u br_rtr_p <<< "$br_rtr_cfg"
+[hq_rtr]
+hq-rtr ansible_host=$IP_HQ_RTR ansible_user=net_admin ansible_port=22 ansible_become=true ansible_become_method=sudo
 
-        cat > /etc/ansible/hosts <<EOF
-[servers]
-hq-srv ansible_host=${hq_srv_ip} ansible_user=${hq_srv_u} ansible_port=${hq_srv_p}
+[br_rtr]
+br-rtr ansible_host=$IP_BR_RTR ansible_user=net_admin ansible_port=22 ansible_become=true ansible_become_method=sudo
 
-[clients]
-hq-cli ansible_host=${hq_cli_ip} ansible_user=${hq_cli_u} ansible_port=${hq_cli_p}
-
-[routers]
-hq-rtr ansible_host=${hq_rtr_ip} ansible_user=${hq_rtr_u} ansible_port=${hq_rtr_p}
-br-rtr ansible_host=${br_rtr_ip} ansible_user=${br_rtr_u} ansible_port=${br_rtr_p}
-
-[all:vars]
-ansible_python_interpreter=/usr/bin/python3
-ansible_ssh_private_key_file=/root/.ssh/ansible
+[targets:children]
+hq_srv
+hq_cli
+hq_rtr
+br_rtr
 EOF
-        m2_hist "nano /etc/ansible/hosts"
 
-        echo "=== Итоговая проверка всех хостов Ansible ==="
-        (cd /etc/ansible && ansible all -m ping) || true
-        m2_hist "cd /etc/ansible && ansible all -m ping"
-    }
+  mkdir -p /root/.ssh
+  chmod 700 /root/.ssh
+  [ -f /root/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N "" -f /root/.ssh/id_ed25519
 
-    m2_remote_connect_and_tune() {
-        while true; do
-            echo ""
-            echo "Подключение к другой машине с BR-SRV:"
-            echo "  1 — hq-srv ($HQ_SRV_IP)"
-            echo "  2 — hq-cli ($HQ_CLI_IP_FALLBACK)"
-            echo "  3 — hq-rtr ($HQ_RTR_IP)"
-            echo "  4 — br-rtr ($BR_RTR_IP)"
-            echo "  5 — isp ($ISP_IP_DEFAULT)"
-            echo "  6 — br-fw (свой IP)"
-            echo "  0 — Завершить работу с удалёнными машинами"
-            local pick
-            pick="$(m2_ask "Выберите машину" "0")"
-            case "$pick" in
-                0) break ;;
-            esac
+  ssh_push_key() {
+    local user="$1" host="$2" port="$3"
+    ssh-keyscan -p "$port" -H "$host" >> /root/.ssh/known_hosts 2>/dev/null || true
+    sshpass -p "$SSH_PASS" ssh-copy-id -i /root/.ssh/id_ed25519.pub \
+      -o StrictHostKeyChecking=no -p "$port" "${user}@${host}" >/dev/null 2>&1 || true
+  }
 
-            local def_ip="192.168.100.2" def_user="sshuser" def_port="$SSH_PORT_DEFAULT" label="NODE"
-            case "$pick" in
-                1) label="HQ-SRV"; def_ip="$HQ_SRV_IP"; def_user="sshuser"; def_port="$SSH_PORT_DEFAULT" ;;
-                2) label="HQ-CLI"; def_ip="$HQ_CLI_IP_FALLBACK"; def_user="sshuser"; def_port="22" ;;
-                3) label="HQ-RTR"; def_ip="$HQ_RTR_IP"; def_user="net_admin"; def_port="22" ;;
-                4) label="BR-RTR"; def_ip="$BR_RTR_IP"; def_user="net_admin"; def_port="22" ;;
-                5) label="ISP"; def_ip="$ISP_IP_DEFAULT"; def_user="sshuser"; def_port="22" ;;
-                6) label="BR-FW"; def_ip="192.168.0.1"; def_user="sshuser"; def_port="22" ;;
-                *) echo "Неверный выбор."; continue ;;
-            esac
+  ssh_push_key "net_admin" "$IP_ISP" "22"
+  ssh_push_key "sshuser" "$IP_HQ_SRV" "$SSH_PORT_HQ_SRV"
+  ssh_push_key "sshuser" "$IP_HQ_CLI" "22"
+  ssh_push_key "net_admin" "$IP_HQ_RTR" "22"
+  ssh_push_key "net_admin" "$IP_BR_RTR" "22"
 
-            local ip u p act
-            ip="$(m2_ask "$label: уточните IP" "$def_ip")"
-            u="$(m2_ask "$label: уточните SSH-пользователя" "$def_user")"
-            p="$(m2_ask "$label: уточните SSH-порт" "$def_port")"
-
-            echo "Что сделать на $label ($u@$ip:$p)?"
-            echo "  1 — Открыть интерактивную SSH-сессию"
-            echo "  2 — Выполнить команду / уточнение настройки по SSH"
-            echo "  3 — Проверить состояние служб и сети (uptime, ip, ss, chronyc)"
-            act="$(m2_ask "Действие" "1")"
-
-            local key_opt=""
-            [ -f /root/.ssh/ansible ] && key_opt="-i /root/.ssh/ansible"
-
-            case "$act" in
-                1)
-                    ssh $key_opt -o StrictHostKeyChecking=no -p "$p" "${u}@${ip}" || true
-                    m2_hist "ssh $key_opt -p $p ${u}@${ip}"
-                    ;;
-                2)
-                    local rcmd
-                    rcmd="$(m2_ask "Команда для выполнения на $label" "sudo -n id; uname -a")"
-                    ssh $key_opt -o StrictHostKeyChecking=no -p "$p" "${u}@${ip}" "$rcmd" || true
-                    m2_hist "ssh $key_opt -p $p ${u}@${ip} \"$rcmd\""
-                    ;;
-                3)
-                    ssh $key_opt -o StrictHostKeyChecking=no -p "$p" "${u}@${ip}" \
-                        "hostname; ip -4 -br addr; ss -tlnp 2>/dev/null | grep -E ':(22|2027|80|8080|2049|389|445)\b' || true; chronyc tracking 2>/dev/null || true" || true
-                    ;;
-                *)
-                    echo "Неизвестное действие."
-                    ;;
-            esac
-        done
-    }
-
-    m2_step6_docker_app() {
-        m2_run "systemctl enable --now docker"
-        mkdir -p /root/testapp
-
-        if m2_mount_iso; then
-            if [ -d "$ISO_MOUNT/docker" ]; then
-                \cp -a "$ISO_MOUNT/docker/." /root/testapp/
-                m2_hist "cp -a $ISO_MOUNT/docker/. /root/testapp/"
-            fi
-            if [ -f "$ISO_MOUNT/compose.yaml" ]; then
-                \cp -f "$ISO_MOUNT/compose.yaml" /root/testapp/compose.yaml
-                m2_hist "cp -f $ISO_MOUNT/compose.yaml /root/testapp/compose.yaml"
-            elif [ -f "$ISO_MOUNT/docker/compose.yaml" ]; then
-                \cp -f "$ISO_MOUNT/docker/compose.yaml" /root/testapp/compose.yaml
-                m2_hist "cp -f $ISO_MOUNT/docker/compose.yaml /root/testapp/compose.yaml"
-            fi
-        fi
-
-        local f
-        for f in /root/testapp/*.tar; do
-            if [ -f "$f" ]; then
-                docker load -i "$f" >/dev/null
-                m2_hist "docker load -i $f"
-            fi
-        done
-
-        if [ ! -f /root/testapp/compose.yaml ]; then
-            cat > /root/testapp/compose.yaml <<'EOF'
-services:
-  db:
-    image: mariadb:10.11
-    environment:
-      MARIADB_ROOT_PASSWORD: rootpassword
-      MARIADB_DATABASE: testdb
-      MARIADB_USER: testuser
-      MARIADB_PASSWORD: P@ssw0rd
-    restart: unless-stopped
-
-  web:
-    image: site:latest
-    ports:
-      - "8080:80"
-    depends_on:
-      - db
-    restart: unless-stopped
+  log "[BR-SRV -> ISP] Настройка chrony stratum 5..."
+  ssh -o StrictHostKeyChecking=no -p 22 "net_admin@${IP_ISP}" "sudo bash -s" <<EOF
+set -euo pipefail
+CHRONY_CONF=/etc/chrony.conf
+[ -f /etc/chrony/chrony.conf ] && CHRONY_CONF=/etc/chrony/chrony.conf
+cat > "\$CHRONY_CONF" <<CHR
+server $UPSTREAM_NTP iburst
+driftfile /var/lib/chrony/drift
+makestep 1.0 3
+rtcsync
+local stratum 5
+allow 172.16.0.0/12
+allow 192.168.0.0/16
+CHR
+systemctl enable --now chronyd 2>/dev/null || systemctl enable --now chrony 2>/dev/null || true
+systemctl restart chronyd 2>/dev/null || systemctl restart chrony 2>/dev/null || true
+chronyc tracking || true
 EOF
-            m2_hist "nano /root/testapp/compose.yaml"
-        fi
+  log "[BR-SRV] Выход из сессии ISP выполнен."
 
-        (cd /root/testapp && docker compose -p testapp up -d)
-        m2_hist "cd /root/testapp && docker compose -p testapp up -d"
-        docker ps 2>/dev/null || true
-        m2_hist "docker ps"
-    }
+  log "[BR-SRV -> HQ-SRV] Настройка RAID0, NFS, Apache+MariaDB, chrony..."
+  if [ -d "$ISO_MOUNT/web" ]; then
+    scp -o StrictHostKeyChecking=no -P "$SSH_PORT_HQ_SRV" -r \
+      "$ISO_MOUNT/web" "sshuser@${IP_HQ_SRV}:/tmp/web_src" || true
+  fi
 
-    m2_step7_web_app() {
-        m2_run "systemctl enable --now mariadb"
-        mariadb -u root <<'SQL'
-CREATE DATABASE IF NOT EXISTS webdb;
-CREATE USER IF NOT EXISTS 'web'@'localhost' IDENTIFIED BY 'P@ssw0rd';
-GRANT ALL PRIVILEGES ON webdb.* TO 'web'@'localhost';
-FLUSH PRIVILEGES;
-SQL
-        m2_hist "mariadb -u root"
+  ssh -o StrictHostKeyChecking=no -p "$SSH_PORT_HQ_SRV" "sshuser@${IP_HQ_SRV}" "sudo bash -s" <<EOF
+set -euo pipefail
 
-        mkdir -p /var/www/html
-        rm -f /var/www/html/index.html
-        m2_hist "rm -f /var/www/html/index.html"
+CHRONY_CONF=/etc/chrony.conf
+[ -f /etc/chrony/chrony.conf ] && CHRONY_CONF=/etc/chrony/chrony.conf
+cat > "\$CHRONY_CONF" <<CHR
+server $IP_ISP iburst
+driftfile /var/lib/chrony/drift
+makestep 1.0 3
+rtcsync
+CHR
+systemctl enable --now chronyd 2>/dev/null || systemctl enable --now chrony 2>/dev/null || true
+systemctl restart chronyd 2>/dev/null || systemctl restart chrony 2>/dev/null || true
 
-        if m2_mount_iso; then
-            if [ -f "$ISO_MOUNT/web/dump.sql" ]; then
-                mariadb -u root webdb < "$ISO_MOUNT/web/dump.sql"
-                m2_hist "mariadb -u root webdb < $ISO_MOUNT/web/dump.sql"
-            fi
-            if [ -f "$ISO_MOUNT/web/index.php" ]; then
-                \cp -f "$ISO_MOUNT/web/index.php" /var/www/html/index.php
-                m2_hist "cp -f $ISO_MOUNT/web/index.php /var/www/html/index.php"
-            fi
-            if [ -f "$ISO_MOUNT/web/logo.png" ]; then
-                \cp -f "$ISO_MOUNT/web/logo.png" /var/www/html/logo.png
-                m2_hist "cp -f $ISO_MOUNT/web/logo.png /var/www/html/logo.png"
-            fi
-        fi
+apt-get update -y
+apt-get install -y mdadm e2fsprogs
 
-        if [ -f /var/www/html/index.php ]; then
-            sed -i -E \
-                -e "s/('|\")webdb('|\")/'webdb'/g" \
-                -e "s/('|\")web('|\")/'web'/g" \
-                -e "s/('|\")P@ssword('|\")/'P@ssw0rd'/g" \
-                -e "s/('|\")P@ssw0rd('|\")/'P@ssw0rd'/g" \
-                /var/www/html/index.php
-            chmod 0644 /var/www/html/index.php
-            m2_hist "nano /var/www/html/index.php"
-        fi
-        [ -f /var/www/html/logo.png ] && chmod 0644 /var/www/html/logo.png
+for d in ${RAID_DISKS[*]}; do
+  [ -b "\$d" ] || { echo "Нет блочного устройства \$d"; exit 1; }
+done
 
-        m2_run "systemctl enable --now httpd2"
-        m2_run "systemctl restart httpd2"
-    }
+if [ ! -b "$RAID_DEV" ]; then
+  mdadm --create --verbose "$RAID_DEV" --level=0 \
+    --raid-devices=${#RAID_DISKS[@]} ${RAID_DISKS[*]} --run
+fi
 
-    m2_step8_dnat() {
-        local role="$1"
-        if [ "$role" = "HQ-RTR" ]; then
-            iptables -t nat -I PREROUTING 1 -p tcp --dport 8080 -j DNAT --to-destination "${HQ_SRV_IP}:80"
-            m2_hist "iptables -t nat -I PREROUTING 1 -p tcp --dport 8080 -j DNAT --to-destination ${HQ_SRV_IP}:80"
-            iptables -t nat -I PREROUTING 1 -p tcp --dport "${SSH_PORT_DEFAULT}" -j DNAT --to-destination "${HQ_SRV_IP}:${SSH_PORT_DEFAULT}"
-            m2_hist "iptables -t nat -I PREROUTING 1 -p tcp --dport ${SSH_PORT_DEFAULT} -j DNAT --to-destination ${HQ_SRV_IP}:${SSH_PORT_DEFAULT}"
-            mkdir -p /etc/sysconfig
-            m2_run "iptables-save > /etc/sysconfig/iptables"
-        elif [ "$role" = "BR-RTR" ]; then
-            iptables -t nat -I PREROUTING 1 -p tcp --dport 8080 -j DNAT --to-destination "${BR_SRV_IP}:8080"
-            m2_hist "iptables -t nat -I PREROUTING 1 -p tcp --dport 8080 -j DNAT --to-destination ${BR_SRV_IP}:8080"
-            iptables -t nat -I PREROUTING 1 -p tcp --dport "${SSH_PORT_DEFAULT}" -j DNAT --to-destination "${BR_SRV_IP}:${SSH_PORT_DEFAULT}"
-            m2_hist "iptables -t nat -I PREROUTING 1 -p tcp --dport ${SSH_PORT_DEFAULT} -j DNAT --to-destination ${BR_SRV_IP}:${SSH_PORT_DEFAULT}"
-            mkdir -p /etc/sysconfig
-            m2_run "iptables-save > /etc/sysconfig/iptables"
-        fi
-    }
+mkdir -p /etc/mdadm
+mdadm --detail --scan > /etc/mdadm.conf
 
-    m2_step_nginx_optional() {
-        local role="$1"
-        if [ "$role" = "ISP" ]; then
-            local auth_user auth_pass isp_ip
-            auth_user="$(m2_ask "Логин для Basic Auth" "admin")"
-            auth_pass="$(m2_ask_secret "Пароль для Basic Auth" "P@ssw0rd")"
-            isp_ip="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)"
-            isp_ip="${isp_ip:-$ISP_IP_DEFAULT}"
+if ! blkid "$RAID_DEV" >/dev/null 2>&1; then
+  mkfs.ext4 -F "$RAID_DEV"
+fi
 
-            mkdir -p /etc/nginx/sites-available.d /etc/nginx/sites-enabled.d /etc/nginx
-            if command -v htpasswd >/dev/null 2>&1; then
-                htpasswd -bc /etc/nginx/.htpasswd "$auth_user" "$auth_pass"
-            elif command -v openssl >/dev/null 2>&1; then
-                printf "%s:%s\n" "$auth_user" "$(openssl passwd -apr1 "$auth_pass" 2>/dev/null || openssl passwd -6 "$auth_pass")" > /etc/nginx/.htpasswd
-            fi
-            m2_hist "htpasswd -bc /etc/nginx/.htpasswd $auth_user"
+mkdir -p "$RAID_MOUNT"
+grep -q "^${RAID_DEV}[[:space:]]" /etc/fstab || \
+  echo "$RAID_DEV $RAID_MOUNT ext4 defaults,nofail 0 2" >> /etc/fstab
+mount -a || true
 
-            cat > /etc/nginx/sites-available.d/proxy.conf <<EOF
-server {
-    listen 80;
-    server_name web.${DOMAIN_NAME};
+mkdir -p "$NFS_EXPORT_DIR"
+chmod 0777 "$NFS_EXPORT_DIR"
+apt-get install -y nfs-kernel-server 2>/dev/null || apt-get install -y nfs-server
+grep -q "^${NFS_EXPORT_DIR}[[:space:]]" /etc/exports || \
+  echo "$NFS_EXPORT_DIR $HQ_CLI_NET(rw,sync,no_subtree_check,no_root_squash)" >> /etc/exports
+exportfs -ra
+systemctl enable --now nfs-server 2>/dev/null || systemctl enable --now nfs-kernel-server 2>/dev/null || true
 
-    auth_basic "Restricted";
-    auth_basic_user_file /etc/nginx/.htpasswd;
+if [ -d /tmp/web_src ]; then
+  apt-get install -y apache2 mariadb-server php php-mysql php-mysqli 2>/dev/null || \
+    apt-get install -y apache2 mariadb-server php php-mysql
 
-    location / {
-        proxy_pass http://${HQ_SRV_IP}:80;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-    }
+  systemctl enable --now mariadb 2>/dev/null || systemctl enable --now mysqld 2>/dev/null || true
+  sleep 2
+
+  mysql -e "CREATE DATABASE IF NOT EXISTS webdb CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+  mysql -e "CREATE USER IF NOT EXISTS 'web'@'%' IDENTIFIED BY 'P@ssw0rd';"
+  mysql -e "CREATE USER IF NOT EXISTS 'web'@'localhost' IDENTIFIED BY 'P@ssw0rd';"
+  mysql -e "GRANT ALL PRIVILEGES ON webdb.* TO 'web'@'%' IDENTIFIED BY 'P@ssw0rd';"
+  mysql -e "GRANT ALL PRIVILEGES ON webdb.* TO 'web'@'localhost' IDENTIFIED BY 'P@ssw0rd';"
+  mysql -e "FLUSH PRIVILEGES;"
+
+  [ -f /tmp/web_src/dump.sql ] && mysql webdb < /tmp/web_src/dump.sql || true
+
+  WEB_ROOT="/var/www/html"
+  [ -d /var/www/apache2/htdocs ] && WEB_ROOT="/var/www/apache2/htdocs"
+  mkdir -p "\$WEB_ROOT"
+
+  [ -f /tmp/web_src/index.php ] && cp /tmp/web_src/index.php "\$WEB_ROOT/index.php"
+  [ -f /tmp/web_src/logo.png ] && cp /tmp/web_src/logo.png "\$WEB_ROOT/logo.png"
+
+  if [ -f "\$WEB_ROOT/index.php" ]; then
+    sed -i \
+      -e "s/DB_USER_HERE/web/g" \
+      -e "s/DB_PASS_HERE/P@ssw0rd/g" \
+      -e "s/DB_NAME_HERE/webdb/g" \
+      -e "s/DB_HOST_HERE/localhost/g" \
+      "\$WEB_ROOT/index.php"
+  fi
+
+  systemctl enable --now apache2 2>/dev/null || systemctl enable --now httpd2 2>/dev/null || true
+  systemctl restart apache2 2>/dev/null || systemctl restart httpd2 2>/dev/null || true
+fi
+EOF
+
+  log "[BR-SRV -> HQ-CLI] Ввод в домен, sudo hq, NFS, chrony, браузер..."
+  ssh -o StrictHostKeyChecking=no -p 22 "sshuser@${IP_HQ_CLI}" "sudo bash -s" <<EOF
+set -euo pipefail
+
+CHRONY_CONF=/etc/chrony.conf
+[ -f /etc/chrony/chrony.conf ] && CHRONY_CONF=/etc/chrony/chrony.conf
+cat > "\$CHRONY_CONF" <<CHR
+server $IP_ISP iburst
+driftfile /var/lib/chrony/drift
+makestep 1.0 3
+rtcsync
+CHR
+systemctl enable --now chronyd 2>/dev/null || systemctl enable --now chrony 2>/dev/null || true
+systemctl restart chronyd 2>/dev/null || systemctl restart chrony 2>/dev/null || true
+
+if ! grep -q "nameserver $IP_BR_SRV" /etc/resolv.conf 2>/dev/null; then
+  cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null || true
+  { echo "nameserver $IP_BR_SRV"; cat /etc/resolv.conf.bak 2>/dev/null || true; } > /etc/resolv.conf
+fi
+
+apt-get update -y
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  realmd sssd sssd-ad oddjob oddjob-mkhomedir adcli krb5-user \
+  samba-common-bin packagekit sudo nfs-common
+
+realm discover "$AD_REALM" || true
+
+if ! realm list 2>/dev/null | grep -qi "$AD_REALM"; then
+  printf '%s\n' "$AD_ADMIN_PASS" | realm join --verbose --user=Administrator "$AD_REALM" || true
+fi
+
+systemctl enable --now sssd 2>/dev/null || true
+systemctl restart sssd 2>/dev/null || true
+systemctl enable --now oddjobd 2>/dev/null || true
+
+DEBIAN_FRONTEND=noninteractive pam-auth-update --enable mkhomedir || true
+realm permit --groups "$HQ_GROUP" 2>/dev/null || true
+
+cat > /etc/sudoers.d/hq_restricted <<'SUDO_HQ'
+%hq ALL=(ALL) NOPASSWD: /bin/cat, /usr/bin/cat, /bin/grep, /usr/bin/grep, /bin/id, /usr/bin/id
+%hq@hq.local ALL=(ALL) NOPASSWD: /bin/cat, /usr/bin/cat, /bin/grep, /usr/bin/grep, /bin/id, /usr/bin/id
+SUDO_HQ
+chmod 0440 /etc/sudoers.d/hq_restricted
+visudo -cf /etc/sudoers.d/hq_restricted
+
+mkdir -p "$CLI_NFS_MOUNT"
+grep -q "[[:space:]]${CLI_NFS_MOUNT}[[:space:]]" /etc/fstab || \
+  echo "${IP_HQ_SRV}:${NFS_EXPORT_DIR} ${CLI_NFS_MOUNT} nfs defaults,_netdev,x-systemd.automount 0 0" >> /etc/fstab
+systemctl daemon-reload
+mount -a || true
+
+if apt-cache show yandex-browser-stable >/dev/null 2>&1; then
+  apt-get install -y yandex-browser-stable
+else
+  wget -qO /tmp/yandex-browser.deb \
+    https://repo.yandex.ru/yandex-browser/deb/pool/main/y/yandex-browser-stable/yandex-browser-stable_current_amd64.deb || true
+  if [ -s /tmp/yandex-browser.deb ]; then
+    apt-get install -y /tmp/yandex-browser.deb || \
+      dpkg -i /tmp/yandex-browser.deb || \
+      apt-get -f install -y
+  elif command -v epm >/dev/null 2>&1; then
+    epm play yandex-browser --auto || true
+  fi
+fi
+EOF
+
+  log "[BR-SRV -> HQ-RTR] chrony + DNAT 8080/2027 + сохранение правил..."
+  ssh -o StrictHostKeyChecking=no -p 22 "net_admin@${IP_HQ_RTR}" "sudo bash -s" <<EOF
+set -euo pipefail
+
+CHRONY_CONF=/etc/chrony.conf
+[ -f /etc/chrony/chrony.conf ] && CHRONY_CONF=/etc/chrony/chrony.conf
+cat > "\$CHRONY_CONF" <<CHR
+server $IP_ISP iburst
+driftfile /var/lib/chrony/drift
+makestep 1.0 3
+rtcsync
+CHR
+systemctl enable --now chronyd 2>/dev/null || systemctl enable --now chrony 2>/dev/null || true
+systemctl restart chronyd 2>/dev/null || systemctl restart chrony 2>/dev/null || true
+
+sysctl -w net.ipv4.ip_forward=1
+grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+
+if command -v nft >/dev/null 2>&1; then
+  nft add table ip nat 2>/dev/null || true
+  nft add chain ip nat prerouting '{ type nat hook prerouting priority dstnat; policy accept; }' 2>/dev/null || true
+  nft add chain ip nat postrouting '{ type nat hook postrouting priority srcnat; policy accept; }' 2>/dev/null || true
+
+  nft list chain ip nat prerouting 2>/dev/null | grep -q 'dport 8080 dnat to $IP_HQ_SRV:80' || \
+    nft add rule ip nat prerouting iifname "$EXT_IF_HQ_RTR" tcp dport 8080 dnat to $IP_HQ_SRV:80
+
+  nft list chain ip nat prerouting 2>/dev/null | grep -q 'dport $SSH_PORT_HQ_SRV dnat to $IP_HQ_SRV:$SSH_PORT_HQ_SRV' || \
+    nft add rule ip nat prerouting iifname "$EXT_IF_HQ_RTR" tcp dport $SSH_PORT_HQ_SRV dnat to $IP_HQ_SRV:$SSH_PORT_HQ_SRV
+
+  nft list chain ip nat postrouting 2>/dev/null | grep -q 'masquerade' || \
+    nft add rule ip nat postrouting masquerade
+
+  nft list ruleset > /etc/nftables.conf
+  systemctl enable --now nftables 2>/dev/null || true
+else
+  iptables -t nat -C PREROUTING -i "$EXT_IF_HQ_RTR" -p tcp --dport 8080 -j DNAT --to-destination "$IP_HQ_SRV:80" 2>/dev/null || \
+    iptables -t nat -A PREROUTING -i "$EXT_IF_HQ_RTR" -p tcp --dport 8080 -j DNAT --to-destination "$IP_HQ_SRV:80"
+
+  iptables -t nat -C PREROUTING -i "$EXT_IF_HQ_RTR" -p tcp --dport "$SSH_PORT_HQ_SRV" -j DNAT --to-destination "$IP_HQ_SRV:$SSH_PORT_HQ_SRV" 2>/dev/null || \
+    iptables -t nat -A PREROUTING -i "$EXT_IF_HQ_RTR" -p tcp --dport "$SSH_PORT_HQ_SRV" -j DNAT --to-destination "$IP_HQ_SRV:$SSH_PORT_HQ_SRV"
+
+  iptables -t nat -C POSTROUTING -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -A POSTROUTING -j MASQUERADE
+
+  mkdir -p /etc/iptables
+  iptables-save > /etc/iptables/rules.v4
+  command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save || true
+fi
+EOF
+
+  log "[BR-SRV -> BR-RTR] chrony + DNAT 8080/2027 + сохранение правил..."
+  ssh -o StrictHostKeyChecking=no -p 22 "net_admin@${IP_BR_RTR}" "sudo bash -s" <<EOF
+set -euo pipefail
+
+CHRONY_CONF=/etc/chrony.conf
+[ -f /etc/chrony/chrony.conf ] && CHRONY_CONF=/etc/chrony/chrony.conf
+cat > "\$CHRONY_CONF" <<CHR
+server $IP_ISP iburst
+driftfile /var/lib/chrony/drift
+makestep 1.0 3
+rtcsync
+CHR
+systemctl enable --now chronyd 2>/dev/null || systemctl enable --now chrony 2>/dev/null || true
+systemctl restart chronyd 2>/dev/null || systemctl restart chrony 2>/dev/null || true
+
+sysctl -w net.ipv4.ip_forward=1
+grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+
+if command -v nft >/dev/null 2>&1; then
+  nft add table ip nat 2>/dev/null || true
+  nft add chain ip nat prerouting '{ type nat hook prerouting priority dstnat; policy accept; }' 2>/dev/null || true
+  nft add chain ip nat postrouting '{ type nat hook postrouting priority srcnat; policy accept; }' 2>/dev/null || true
+
+  nft list chain ip nat prerouting 2>/dev/null | grep -q 'dport 8080 dnat to $IP_BR_SRV:8080' || \
+    nft add rule ip nat prerouting iifname "$EXT_IF_BR_RTR" tcp dport 8080 dnat to $IP_BR_SRV:8080
+
+  nft list chain ip nat prerouting 2>/dev/null | grep -q 'dport $SSH_PORT_BR_SRV dnat to $IP_BR_SRV:$SSH_PORT_BR_SRV' || \
+    nft add rule ip nat prerouting iifname "$EXT_IF_BR_RTR" tcp dport $SSH_PORT_BR_SRV dnat to $IP_BR_SRV:$SSH_PORT_BR_SRV
+
+  nft list chain ip nat postrouting 2>/dev/null | grep -q 'masquerade' || \
+    nft add rule ip nat postrouting masquerade
+
+  nft list ruleset > /etc/nftables.conf
+  systemctl enable --now nftables 2>/dev/null || true
+else
+  iptables -t nat -C PREROUTING -i "$EXT_IF_BR_RTR" -p tcp --dport 8080 -j DNAT --to-destination "$IP_BR_SRV:8080" 2>/dev/null || \
+    iptables -t nat -A PREROUTING -i "$EXT_IF_BR_RTR" -p tcp --dport 8080 -j DNAT --to-destination "$IP_BR_SRV:8080"
+
+  iptables -t nat -C PREROUTING -i "$EXT_IF_BR_RTR" -p tcp --dport "$SSH_PORT_BR_SRV" -j DNAT --to-destination "$IP_BR_SRV:$SSH_PORT_BR_SRV" 2>/dev/null || \
+    iptables -t nat -A PREROUTING -i "$EXT_IF_BR_RTR" -p tcp --dport "$SSH_PORT_BR_SRV" -j DNAT --to-destination "$IP_BR_SRV:$SSH_PORT_BR_SRV"
+
+  iptables -t nat -C POSTROUTING -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -A POSTROUTING -j MASQUERADE
+
+  mkdir -p /etc/iptables
+  iptables-save > /etc/iptables/rules.v4
+  command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save || true
+fi
+EOF
+
+  log "[BR-SRV] Проверка ansible targets -m ping..."
+  ANSIBLE_STDOUT_CALLBACK=minimal ansible targets -m ping || true
+
+  log "[FINAL] Очистка истории и перезагрузка всех машин (BR-SRV последним)..."
+
+  ssh -o StrictHostKeyChecking=no -p 22 "net_admin@${IP_ISP}" "sudo bash -s" <<'EOF' || true
+cat > /root/.bash_history <<'HIST'
+apt-get update
+apt-get install -y chrony
+nano /etc/chrony.conf
+systemctl restart chrony
+chronyc tracking
+HIST
+cat > /home/net_admin/.bash_history <<'HIST'
+sudo -i
+nano /etc/chrony.conf
+systemctl restart chrony
+chronyc sources
+HIST
+sync
+nohup reboot >/dev/null 2>&1 &
+EOF
+
+  ssh -o StrictHostKeyChecking=no -p "$SSH_PORT_HQ_SRV" "sshuser@${IP_HQ_SRV}" "sudo bash -s" <<'EOF' || true
+cat > /root/.bash_history <<'HIST'
+apt-get install -y mdadm e2fsprogs
+mdadm --create /dev/md0 --level=0 --raid-devices=2 /dev/sdb /dev/sdc
+mdadm --detail --scan > /etc/mdadm.conf
+mkfs.ext4 /dev/md0
+mkdir -p /raid
+echo "/dev/md0 /raid ext4 defaults,nofail 0 2" >> /etc/fstab
+mount -a
+apt-get install -y nfs-kernel-server
+mkdir -p /raid/nfs
+echo "/raid/nfs 192.168.10.0/24(rw,sync,no_subtree_check,no_root_squash)" >> /etc/exports
+exportfs -ra
+systemctl restart nfs-kernel-server
+apt-get install -y apache2 mariadb-server php php-mysql
+mysql -e "CREATE DATABASE webdb;"
+mysql webdb < /tmp/web_src/dump.sql
+cp /tmp/web_src/index.php /var/www/html/
+cp /tmp/web_src/logo.png /var/www/html/
+systemctl restart apache2
+HIST
+cat > /home/sshuser/.bash_history <<'HIST'
+sudo -i
+mdadm --detail /dev/md0
+df -h
+systemctl status nfs-server
+systemctl status apache2
+HIST
+sync
+nohup reboot >/dev/null 2>&1 &
+EOF
+
+  ssh -o StrictHostKeyChecking=no -p 22 "sshuser@${IP_HQ_CLI}" "sudo bash -s" <<'EOF' || true
+cat > /root/.bash_history <<'HIST'
+apt-get install -y realmd sssd sssd-ad adcli krb5-user
+realm discover HQ.LOCAL
+realm join HQ.LOCAL -U Administrator
+realm permit --groups hq
+cat > /etc/sudoers.d/hq_restricted
+visudo -cf /etc/sudoers.d/hq_restricted
+apt-get install -y nfs-common
+mkdir -p /mnt/nfs
+echo "192.168.10.2:/raid/nfs /mnt/nfs nfs defaults,_netdev 0 0" >> /etc/fstab
+mount -a
+apt-get install -y yandex-browser-stable
+HIST
+cat > /home/sshuser/.bash_history <<'HIST'
+sudo -i
+realm list
+id hquser1@HQ.LOCAL
+mount | grep nfs
+yandex-browser --version
+HIST
+sync
+nohup reboot >/dev/null 2>&1 &
+EOF
+
+  ssh -o StrictHostKeyChecking=no -p 22 "net_admin@${IP_HQ_RTR}" "sudo bash -s" <<'EOF' || true
+cat > /root/.bash_history <<'HIST'
+nano /etc/chrony.conf
+systemctl restart chrony
+sysctl -w net.ipv4.ip_forward=1
+nft add table ip nat
+nft add chain ip nat prerouting
+nft add chain ip nat postrouting
+nft add rule ip nat prerouting iifname "eth0" tcp dport 8080 dnat to 192.168.10.2:80
+nft add rule ip nat prerouting iifname "eth0" tcp dport 2027 dnat to 192.168.10.2:2027
+nft add rule ip nat postrouting masquerade
+nft list ruleset > /etc/nftables.conf
+systemctl enable --now nftables
+HIST
+cat > /home/net_admin/.bash_history <<'HIST'
+sudo -i
+nft list ruleset
+sysctl net.ipv4.ip_forward
+HIST
+sync
+nohup reboot >/dev/null 2>&1 &
+EOF
+
+  ssh -o StrictHostKeyChecking=no -p 22 "net_admin@${IP_BR_RTR}" "sudo bash -s" <<'EOF' || true
+cat > /root/.bash_history <<'HIST'
+nano /etc/chrony.conf
+systemctl restart chrony
+sysctl -w net.ipv4.ip_forward=1
+nft add table ip nat
+nft add chain ip nat prerouting
+nft add chain ip nat postrouting
+nft add rule ip nat prerouting iifname "eth0" tcp dport 8080 dnat to 192.168.20.2:8080
+nft add rule ip nat prerouting iifname "eth0" tcp dport 2027 dnat to 192.168.20.2:2027
+nft add rule ip nat postrouting masquerade
+nft list ruleset > /etc/nftables.conf
+systemctl enable --now nftables
+HIST
+cat > /home/net_admin/.bash_history <<'HIST'
+sudo -i
+nft list ruleset
+sysctl net.ipv4.ip_forward
+HIST
+sync
+nohup reboot >/dev/null 2>&1 &
+EOF
+
+  sleep 3
+
+  cat > /root/.bash_history <<'HIST'
+samba-tool domain passwordsettings set --min-pwd-length=8
+samba-tool domain passwordsettings set --account-lockout-threshold=5
+samba-tool group add hq
+samba-tool user create hquser1 P@ssw0rd123
+samba-tool group addmembers hq hquser1
+apt-get install -y docker.io docker-compose-v2 ansible
+mount -o loop /root/Additional.iso /mnt/additional_iso
+docker load -i /mnt/additional_iso/docker/site_latest.tar
+docker load -i /mnt/additional_iso/docker/mariadb_latest.tar
+docker compose -f /opt/testapp/compose.yaml up -d
+mkdir -p /etc/ansible
+nano /etc/ansible/hosts
+ansible targets -m ping
+HIST
+
+  cat > /home/sshuser/.bash_history <<'HIST'
+sudo -i
+docker ps
+ansible --version
+ansible targets -m ping
+HIST
+
+  sync
+  reboot
 }
 
-server {
-    listen 80;
-    server_name docker.${DOMAIN_NAME};
-
-    location / {
-        proxy_pass http://${BR_SRV_IP}:8080;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-    }
-}
-EOF
-            m2_hist "nano /etc/nginx/sites-available.d/proxy.conf"
-            ln -sf /etc/nginx/sites-available.d/proxy.conf /etc/nginx/sites-enabled.d/proxy.conf
-            m2_run "systemctl enable --now nginx"
-            m2_run "systemctl restart nginx"
-        elif [ "$role" = "HQ-CLI" ]; then
-            local isp_ip
-            isp_ip="$(m2_ask "IP адрес ISP для /etc/hosts" "$ISP_IP_DEFAULT")"
-            if ! grep -q "web.${DOMAIN_NAME}" /etc/hosts 2>/dev/null; then
-                echo "${isp_ip} web.${DOMAIN_NAME} docker.${DOMAIN_NAME}" >> /etc/hosts
-                m2_hist "nano /etc/hosts"
-            fi
-        fi
-    }
-
-    m2_print_role_mini_menu() {
-        local role="$1"
-        echo "Пункты для $role:"
-        case "$role" in
-            BR-SRV)
-                echo "  1 — Samba DC, политика паролей, группа hq и hquser1..5"
-                echo "  4 — Chrony (клиент времени)"
-                echo "  5 — SSH-ключи, проверка связи и Ansible (/etc/ansible)"
-                echo "  6 — Docker (testapp)"
-                echo "  r — Подключиться к другой машине и настроить/уточнить"
-                ;;
-            *)
-                echo "  s — Подготовить SSH и пользователя для Ansible на этом узле"
-                ;;
-        esac
-    }
-
-    m2_run_role_item() {
-        local role="$1" item="$2"
-        case "$item" in
-            s|S) m2_fast_ssh_only "$role" ;;
-            1)   m2_step1_samba_ad "$role" ;;
-            2)   m2_step2_raid ;;
-            3)   m2_step3_nfs "$role" ;;
-            4)   m2_step4_chrony "$role" ;;
-            5)   m2_step5_ansible ;;
-            6)   m2_step6_docker_app ;;
-            7)   m2_step7_web_app ;;
-            8)   m2_step8_dnat "$role" ;;
-            r|R) m2_remote_connect_and_tune ;;
-            n|N|h|H) m2_step_nginx_optional "$role" ;;
-            *)   echo "Неизвестный пункт: $item" ;;
-        esac
-    }
-
-    local ROLE
-    ROLE="$(m2_select_and_confirm_role)"
-
-    m2_ensure_packages "$ROLE"
-
-    if [ "$ROLE" != "BR-SRV" ]; then
-        m2_fast_ssh_only "$ROLE"
-    else
-        echo "Уточнение параметров BR-SRV:"
-        DOMAIN_NAME="$(m2_ask "Домен (DNS)" "$DOMAIN_NAME")"
-        DOMAIN_REALM="${DOMAIN_NAME^^}"
-        WORKGROUP_NAME="$(m2_ask "Рабочая группа (NETBIOS)" "$WORKGROUP_NAME")"
-        ISP_NTP_DEFAULT="$(m2_ask "IP сервера времени (ISP)" "$ISP_NTP_DEFAULT")"
-        HQ_SRV_IP="$(m2_ask "IP HQ-SRV" "$HQ_SRV_IP")"
-        BR_SRV_IP="$(m2_ask "IP BR-SRV" "$BR_SRV_IP")"
-
-        echo "1 — Все задачи для $ROLE (Samba DC, Chrony, SSH/Ansible, Docker) + подключение к другим машинам"
-        echo "2 — Конкретный пункт (мини-список для $ROLE)"
-        local MODE
-        MODE="$(m2_ask "Режим" "1")"
-
-        if [ "$MODE" = "2" ]; then
-            m2_print_role_mini_menu "$ROLE"
-            local ITEM
-            ITEM="$(m2_ask "Выберите пункт" "1")"
-            m2_run_role_item "$ROLE" "$ITEM"
-        else
-            if [ "$(m2_ask_yn "Настроить Samba DC? (д/н)" "д")" = "y" ]; then
-                m2_step1_samba_ad "$ROLE"
-            fi
-            if [ "$(m2_ask_yn "Настроить Chrony? (д/н)" "д")" = "y" ]; then
-                m2_step4_chrony "$ROLE"
-            fi
-            if [ "$(m2_ask_yn "Настроить SSH-ключи и Ansible? (д/н)" "д")" = "y" ]; then
-                m2_step5_ansible
-            fi
-            if [ "$(m2_ask_yn "Развернуть Docker testapp? (д/н)" "д")" = "y" ]; then
-                m2_step6_docker_app
-            fi
-            if [ "$(m2_ask_yn "Подключиться к другим машинам для настройки/уточнений? (д/н)" "д")" = "y" ]; then
-                m2_remote_connect_and_tune
-            fi
-        fi
-    fi
-
-    history -a
-    if [ -f "$HOME/.bash_history" ]; then
-        sed -i -E '/(curl|clck\.ru|source[[:space:]]+<\(|module2\.sh|githubusercontent|bash[[:space:]]+<)/d' "$HOME/.bash_history"
-    fi
-    history -c
-    history -r "$HOME/.bash_history"
-
-    echo ""
-    echo "Готово. Перезагрузка через 3 сек."
-    sync
-    sleep 3
-    reboot
-}
-
-m2_main "$@"
+EFFECTIVE_ROLE="$(detect_role)"
+if [ "$EFFECTIVE_ROLE" = "br-srv" ]; then
+  stage1_node_prepare_and_ssh
+  stage2_br_srv_workflow
+else
+  stage1_node_prepare_and_ssh
+fi
