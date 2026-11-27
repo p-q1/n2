@@ -246,8 +246,6 @@ deprecation_warnings = False
 command_warnings = False
 timeout = 15
 EOF
-        
-        # ДОБАВЛЕН localhost и пароли для отказоустойчивости
         cat > /etc/ansible/hosts <<EOF
 [local]
 localhost ansible_connection=local
@@ -278,7 +276,6 @@ EOF
         ssh_push() {
             local user="$1" host="$2" port="$3"
             log "  -> Ключ на $user@$host:$port"
-            # Очистка старых ключей и копирование нового
             sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password -o PubkeyAuthentication=no -p "$port" "${user}@${host}" \
                 "mkdir -p ~/.ssh && chmod 700 ~/.ssh && > ~/.ssh/authorized_keys && echo '$(cat /root/.ssh/id_ed25519.pub)' > ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" >/dev/null 2>&1 || true
         }
@@ -358,7 +355,10 @@ if [ \${#DISK_ARR[@]} -ge 2 ]; then
     mount -a
 fi
 
-apt-get install -y nfs-server rpcbind
+# Правильные пакеты для ALT Linux: nfs-server
+apt-get install -y nfs-server
+# Критически важно: разрешаем rpcbind слушать внешние подключения
+control rpcbind server
 systemctl enable --now rpcbind
 systemctl enable --now nfs-server
 mkdir -p $NFS_EXPORT_DIR && chmod 777 $NFS_EXPORT_DIR
@@ -366,10 +366,9 @@ grep -q "^$NFS_EXPORT_DIR" /etc/exports || echo "$NFS_EXPORT_DIR $HQ_CLI_NET(rw,
 exportfs -ra
 systemctl restart nfs-server
 
-# Ставим то, что точно есть
+# Веб-сервер и PHP для ALT Linux
 apt-get install -y httpd2 mariadb-server 2>/dev/null || apt-get install -y apache2 mariadb-server 2>/dev/null || true
-# В ALT Linux php-mysql обычно тянется как php8-mysql, ставим базу и модули по очереди
-apt-get install -y php8 php8-mysql 2>/dev/null || apt-get install -y php php-mysql 2>/dev/null || apt-get install -y php8.2 php8.2-mysql 2>/dev/null || true
+apt-get install -y php8.2 php8.2-mysql 2>/dev/null || apt-get install -y php php-mysql 2>/dev/null || true
 
 systemctl enable --now mariadb
 systemctl enable --now httpd2 2>/dev/null || systemctl enable --now apache2 2>/dev/null || true
@@ -396,14 +395,18 @@ EOF
         log "[BR-SRV -> HQ-CLI] Ввод в домен, NFS (GUI), Yandex Browser..."
         ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 22 "sshuser@$IP_HQ_CLI" "sudo bash -s" <<EOF
 apt-get update -y
-# Пакеты для домена, без падения если какого-то нет
-apt-get install -y realmd sssd sssd-ad adcli krb5 rpcbind 2>/dev/null || true
+# Отключаем avahi-daemon, чтобы он не мешал разрешению домена .local
+systemctl stop avahi-daemon 2>/dev/null || true
+systemctl disable avahi-daemon 2>/dev/null || true
+
+# Пакеты для домена и NFS-клиента (в ALT Linux это nfs-clients)
+apt-get install -y realmd sssd sssd-ad adcli nfs-clients rpcbind 2>/dev/null || true
 
 echo "$IP_BR_SRV br-srv.hq.local hq.local" >> /etc/hosts
 echo "nameserver $IP_BR_SRV" > /etc/resolv.conf
 
 systemctl enable --now rpcbind
-systemctl enable --now nfs-common 2>/dev/null || systemctl enable --now nfs-client 2>/dev/null || true
+systemctl enable --now nfs-client.target 2>/dev/null || systemctl enable --now nfs-client 2>/dev/null || true
 
 # Ввод в домен
 echo "$AD_ADMIN_PASS" | realm join -U Administrator --client-software=sssd $AD_REALM || true
@@ -412,13 +415,14 @@ realm permit --groups $HQ_GROUP
 echo "%$HQ_GROUP ALL=(ALL) NOPASSWD: /bin/cat, /bin/grep, /bin/id" > /etc/sudoers.d/hq_restricted
 chmod 440 /etc/sudoers.d/hq_restricted
 
+# Автомонтирование NFS (с nolock для стабильности)
 mkdir -p $CLI_NFS_MOUNT
-grep -q "$IP_HQ_SRV:$NFS_EXPORT_DIR" /etc/fstab || echo "$IP_HQ_SRV:$NFS_EXPORT_DIR $CLI_NFS_MOUNT nfs defaults,_netdev,nolock 0 0" >> /etc/fstab
+grep -q "$IP_HQ_SRV:$NFS_EXPORT_DIR" /etc/fstab || echo "$IP_HQ_SRV:$NFS_EXPORT_DIR $CLI_NFS_MOUNT nfs defaults,_netdev,nolock,soft,intr 0 0" >> /etc/fstab
 mount -a || true
 
 apt-get install -y yandex-browser-stable 2>/dev/null || true
 
-# Закладка в GNOME
+# Закладка в GNOME (Nautilus)
 cat > /usr/local/bin/setup_nfs_gui.sh <<'EOS'
 #!/bin/bash
 NFS_URI="nfs://${IP_HQ_SRV}:2049${NFS_EXPORT_DIR}"
