@@ -90,11 +90,11 @@ main() {
         RAID_LEVEL=$(ask "Уровень RAID (0/1/5/6/10)" "$RAID_LEVEL")
         
         case "$RAID_LEVEL" in
-            0) log "Для RAID 0 добавьте 2 диска!" ;;
-            1) log "Для RAID 1 добавьте 2 диска!" ;;
-            5) log "Для RAID 5 добавьте минимум 3 диска!" ;;
-            6) log "Для RAID 6 добавьте минимум 4 диска!" ;;
-            10) log "Для RAID 10 добавьте минимум 4 диска (кратно 2)!" ;;
+            0) log "Внимание: Для RAID 0 добавьте 2 диска!" ;;
+            1) log "Внимание: Для RAID 1 добавьте 2 диска!" ;;
+            5) log "Внимание: Для RAID 5 добавьте минимум 3 диска!" ;;
+            6) log "Внимание: Для RAID 6 добавьте минимум 4 диска!" ;;
+            10) log "Внимание: Для RAID 10 добавьте минимум 4 диска (кратно 2)!" ;;
             *) log "Выбран неизвестный уровень. Будет попытка создать с текущими дисками." ;;
         esac
 
@@ -246,22 +246,23 @@ deprecation_warnings = False
 command_warnings = False
 timeout = 15
 EOF
-        # ДОБАВЛЕН localhost
+        
+        # ДОБАВЛЕН localhost и пароли для отказоустойчивости
         cat > /etc/ansible/hosts <<EOF
 [local]
 localhost ansible_connection=local
 
 [hq_srv]
-hq-srv ansible_host=$IP_HQ_SRV ansible_user=sshuser ansible_port=$SSH_PORT_HQ_SRV ansible_become=true
+hq-srv ansible_host=$IP_HQ_SRV ansible_user=sshuser ansible_port=$SSH_PORT_HQ_SRV ansible_password=$SSH_PASS ansible_become_password=$SSH_PASS ansible_become=true
 
 [hq_cli]
-hq-cli ansible_host=$IP_HQ_CLI ansible_user=sshuser ansible_port=22 ansible_become=true
+hq-cli ansible_host=$IP_HQ_CLI ansible_user=sshuser ansible_port=22 ansible_password=$SSH_PASS ansible_become_password=$SSH_PASS ansible_become=true
 
 [hq_rtr]
-hq-rtr ansible_host=$IP_HQ_RTR ansible_user=net_admin ansible_port=22 ansible_become=true
+hq-rtr ansible_host=$IP_HQ_RTR ansible_user=net_admin ansible_port=22 ansible_password=$SSH_PASS ansible_become_password=$SSH_PASS ansible_become=true
 
 [br_rtr]
-br-rtr ansible_host=$IP_BR_RTR ansible_user=net_admin ansible_port=22 ansible_become=true
+br-rtr ansible_host=$IP_BR_RTR ansible_user=net_admin ansible_port=22 ansible_password=$SSH_PASS ansible_become_password=$SSH_PASS ansible_become=true
 
 [targets:children]
 local
@@ -277,8 +278,9 @@ EOF
         ssh_push() {
             local user="$1" host="$2" port="$3"
             log "  -> Ключ на $user@$host:$port"
-            # Используем ssh-copy-id для надежности, если пароль запрашивается - передаем через sshpass
-            sshpass -p "$SSH_PASS" ssh-copy-id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password -o PubkeyAuthentication=no -p "$port" "${user}@${host}" >/dev/null 2>&1 || true
+            # Очистка старых ключей и копирование нового
+            sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password -o PubkeyAuthentication=no -p "$port" "${user}@${host}" \
+                "mkdir -p ~/.ssh && chmod 700 ~/.ssh && > ~/.ssh/authorized_keys && echo '$(cat /root/.ssh/id_ed25519.pub)' > ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" >/dev/null 2>&1 || true
         }
 
         log "Раздача SSH-ключей..."
@@ -364,9 +366,10 @@ grep -q "^$NFS_EXPORT_DIR" /etc/exports || echo "$NFS_EXPORT_DIR $HQ_CLI_NET(rw,
 exportfs -ra
 systemctl restart nfs-server
 
-# Использование httpd2 для ALT Linux
-apt-get install -y httpd2 mariadb-server || apt-get install -y apache2 mariadb-server || true
-apt-get install -y php8.3 php8.3-mysql php8.3-apache2 || apt-get install -y php8.2 php8.2-mysql libapache2-mod-php8.2 || true
+# Ставим то, что точно есть
+apt-get install -y httpd2 mariadb-server 2>/dev/null || apt-get install -y apache2 mariadb-server 2>/dev/null || true
+# В ALT Linux php-mysql обычно тянется как php8-mysql, ставим базу и модули по очереди
+apt-get install -y php8 php8-mysql 2>/dev/null || apt-get install -y php php-mysql 2>/dev/null || apt-get install -y php8.2 php8.2-mysql 2>/dev/null || true
 
 systemctl enable --now mariadb
 systemctl enable --now httpd2 2>/dev/null || systemctl enable --now apache2 2>/dev/null || true
@@ -393,8 +396,8 @@ EOF
         log "[BR-SRV -> HQ-CLI] Ввод в домен, NFS (GUI), Yandex Browser..."
         ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 22 "sshuser@$IP_HQ_CLI" "sudo bash -s" <<EOF
 apt-get update -y
-# Пакет krb5-utils вместо krb5
-apt-get install -y realmd sssd sssd-ad adcli krb5-utils nfs-common rpcbind || true
+# Пакеты для домена, без падения если какого-то нет
+apt-get install -y realmd sssd sssd-ad adcli krb5 rpcbind 2>/dev/null || true
 
 echo "$IP_BR_SRV br-srv.hq.local hq.local" >> /etc/hosts
 echo "nameserver $IP_BR_SRV" > /etc/resolv.conf
@@ -402,6 +405,7 @@ echo "nameserver $IP_BR_SRV" > /etc/resolv.conf
 systemctl enable --now rpcbind
 systemctl enable --now nfs-common 2>/dev/null || systemctl enable --now nfs-client 2>/dev/null || true
 
+# Ввод в домен
 echo "$AD_ADMIN_PASS" | realm join -U Administrator --client-software=sssd $AD_REALM || true
 realm permit --groups $HQ_GROUP
 
@@ -441,7 +445,7 @@ chmod +x /usr/local/bin/setup_nfs_gui.sh
 EOF
 
         log "Проверка Ansible..."
-        ANSIBLE_STDOUT_CALLBACK=minimal ansible targets -m ping || true
+        ANSIBLE_HOST_KEY_CHECKING=False ANSIBLE_STDOUT_CALLBACK=minimal ansible targets -m ping -e "ansible_password=$SSH_PASS" || true
         hist "ansible targets -m ping"
 
         log "Очистка истории и перезагрузка всех машин (BR-SRV последним)..."
