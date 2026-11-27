@@ -16,9 +16,7 @@ main() {
         return 1
     fi
 
-    # --- ДЕФОЛТНЫЕ ЗНАЧЕНИЯ (Согласно 1 модулю) ---
     local IP_ISP_EXT="172.16.1.1"
-    local IP_ISP_INT="172.16.2.1"
     local IP_HQ_RTR="172.16.1.2"
     local IP_BR_RTR="172.16.2.2"
 
@@ -80,8 +78,8 @@ main() {
         IP_BR_SRV=$(ask "IP-адрес BR-SRV" "$IP_BR_SRV")
         IP_HQ_SRV=$(ask "IP-адрес HQ-SRV" "$IP_HQ_SRV")
         IP_HQ_CLI=$(ask "IP-адрес HQ-CLI" "$IP_HQ_CLI")
-        IP_HQ_RTR=$(ask "IP-адрес HQ-RTR (внутренний/внешний)" "$IP_HQ_RTR")
-        IP_BR_RTR=$(ask "IP-адрес BR-RTR (внутренний/внешний)" "$IP_BR_RTR")
+        IP_HQ_RTR=$(ask "IP-адрес HQ-RTR" "$IP_HQ_RTR")
+        IP_BR_RTR=$(ask "IP-адрес BR-RTR" "$IP_BR_RTR")
         IP_ISP_EXT=$(ask "IP-адрес ISP (внешний)" "$IP_ISP_EXT")
 
         SSH_PORT_HQ_SRV=$(ask "SSH порт HQ-SRV" "$SSH_PORT_HQ_SRV")
@@ -92,14 +90,16 @@ main() {
         UPSTREAM_NTP=$(ask "NTP сервер" "$UPSTREAM_NTP")
     fi
 
-    # --- ЭТАП 1: БАЗОВАЯ НАСТРОЙКА SSH ---
     stage1_node_prepare_and_ssh() {
         local hn ssh_user target_port
         hn="$(hostname -s 2>/dev/null || hostname)"
 
         log "[ЭТАП 1][$hn] Установка пакетов и настройка SSH..."
         apt-get update -y >/dev/null 2>&1
-        apt-get install -y openssh-server openssh-clients sshpass python3 sudo nano curl wget ca-certificates chrony nftables iptables iproute2 util-linux >/dev/null 2>&1
+        
+        local pkgs="openssh-server openssh-clients sshpass python3 sudo nano curl wget ca-certificates chrony nftables iptables iproute2 util-linux"
+        apt-get install -y $pkgs >/dev/null 2>&1
+        apt-get install -y krb5 2>/dev/null || apt-get install -y krb5-user 2>/dev/null || true
 
         if [[ "$hn" == *isp* ]] || [[ "$hn" == *rtr* ]]; then
             ssh_user="net_admin"
@@ -139,11 +139,9 @@ main() {
         systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
     }
 
-    # --- ЭТАП 2: BR-SRV ---
     stage2_br_srv_workflow() {
         log "[BR-SRV] Настройка локальных сервисов..."
 
-        # 1. Chrony локально
         local chrony_conf="/etc/chrony.conf"
         [ -f /etc/chrony/chrony.conf ] && chrony_conf="/etc/chrony/chrony.conf"
         cat > "$chrony_conf" <<EOF
@@ -155,7 +153,6 @@ EOF
         systemctl enable --now chronyd 2>/dev/null || systemctl enable --now chrony 2>/dev/null || true
         systemctl restart chronyd 2>/dev/null || systemctl restart chrony 2>/dev/null || true
 
-        # 2. Samba DC (Task 1)
         log "[BR-SRV] Настройка Samba DC..."
         if command -v samba-tool >/dev/null 2>&1; then
             if [ ! -f /var/lib/samba/private/sam.ldb ]; then
@@ -179,7 +176,6 @@ EOF
             done
         fi
 
-        # 3. Docker (Task 6)
         log "[BR-SRV] Настройка Docker (testapp)..."
         apt-get install -y docker-engine docker-compose-v2 ansible 2>/dev/null || apt-get install -y docker docker-compose ansible
         systemctl enable --now docker
@@ -229,7 +225,6 @@ EOF
         docker compose up -d || docker-compose up -d
         cd /root
 
-        # 4. Ansible (Task 5)
         log "[BR-SRV] Настройка Ansible..."
         mkdir -p /etc/ansible
         cat > /etc/ansible/ansible.cfg <<'EOF'
@@ -261,15 +256,13 @@ hq_rtr
 br_rtr
 EOF
 
-        # 5. Раздача SSH-ключей (Исправление Permission Denied и запросов пароля)
         mkdir -p /root/.ssh && chmod 700 /root/.ssh
         [ -f /root/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N "" -f /root/.ssh/id_ed25519
 
         ssh_push() {
             local user="$1" host="$2" port="$3"
             log "  -> Ключ на $user@$host:$port"
-            # Используем PreferredAuthentications=password, чтобы sshpass точно сработал
-            sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password -p "$port" "${user}@${host}" \
+            sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password -o PubkeyAuthentication=no -p "$port" "${user}@${host}" \
                 "mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '$(cat /root/.ssh/id_ed25519.pub)' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" >/dev/null 2>&1 || true
         }
 
@@ -280,7 +273,6 @@ EOF
         ssh_push "net_admin" "$IP_HQ_RTR" "22"
         ssh_push "net_admin" "$IP_BR_RTR" "22"
 
-        # 6. Настройка ISP (Chrony - Task 4)
         log "[BR-SRV -> ISP] Настройка chrony stratum 5..."
         ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 22 "net_admin@$IP_ISP_EXT" "sudo bash -s" <<EOF
 CHRONY_CONF=/etc/chrony.conf
@@ -299,7 +291,6 @@ CHR
 systemctl restart chrony
 EOF
 
-        # 7. Настройка маршрутизаторов (NAT, форвардинг - Task 8)
         log "[BR-SRV -> HQ-RTR] Проброс портов 8080/2027..."
         ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 22 "net_admin@$IP_HQ_RTR" "sudo bash -s" <<EOF
 sysctl -w net.ipv4.ip_forward=1
@@ -322,7 +313,6 @@ iptables -P FORWARD ACCEPT
 iptables-save > /etc/sysconfig/iptables 2>/dev/null || iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
 EOF
 
-        # 8. HQ-SRV (RAID, NFS, Web - Task 2, 3, 7)
         log "[BR-SRV -> HQ-SRV] RAID $RAID_LEVEL, NFS, Apache+MariaDB..."
         
         if [ -d "$ISO_MOUNT/web" ]; then
@@ -330,16 +320,13 @@ EOF
         fi
 
         ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSH_PORT_HQ_SRV" "sshuser@$IP_HQ_SRV" "sudo bash -s" <<EOF
-# --- RAID 0 ---
 apt-get update -y && apt-get install -y mdadm e2fsprogs
-# Поиск дисков (sdb/vdb и т.д.)
 DISKS=""
 for d in /dev/sdb /dev/sdc /dev/vdb /dev/vdc /dev/sdd /dev/vdd; do
     if [ -b "\$d" ]; then
         DISKS="\$DISKS \$d"
     fi
 done
-
 DISK_ARR=(\$DISKS)
 if [ \${#DISK_ARR[@]} -ge 2 ]; then
     if [ ! -b "$RAID_DEV" ]; then
@@ -352,7 +339,6 @@ if [ \${#DISK_ARR[@]} -ge 2 ]; then
     mount -a
 fi
 
-# --- NFS ---
 apt-get install -y nfs-server rpcbind
 systemctl enable --now rpcbind
 systemctl enable --now nfs-server
@@ -361,12 +347,11 @@ grep -q "^$NFS_EXPORT_DIR" /etc/exports || echo "$NFS_EXPORT_DIR $HQ_CLI_NET(rw,
 exportfs -ra
 systemctl restart nfs-server
 
-# --- Web (Явное указание пакетов для Astra) ---
-apt-get install -y apache2 mariadb-server php libapache2-mod-php php-mysql
+# Явное указание web-пакетов
+apt-get install -y apache2 mariadb-server php libapache2-mod-php php-mysql || apt-get install -y apache2 mariadb-server php8.2 libapache2-mod-php8.2 php8.2-mysql
 systemctl enable --now mariadb
 systemctl enable --now apache2
 
-# Ожидание запуска MariaDB
 for i in {1..10}; do mysqladmin ping &>/dev/null && break; sleep 1; done
 
 if [ -d /tmp/web_src ]; then
@@ -382,19 +367,17 @@ if [ -d /tmp/web_src ]; then
 fi
 EOF
 
-        # 9. HQ-CLI (Ввод в домен, NFS, Yandex Browser - Task 1, 3, 9)
         log "[BR-SRV -> HQ-CLI] Ввод в домен, NFS, Yandex Browser..."
         ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 22 "sshuser@$IP_HQ_CLI" "sudo bash -s" <<EOF
-# Обновление репозиториев и установка пакетов
 apt-get update -y
-apt-get install -y realmd sssd sssd-ad adcli krb5-user nfs-common rpcbind
+# В Astra пакет называется krb5, а не krb5-user
+apt-get install -y realmd sssd sssd-ad adcli krb5 nfs-common rpcbind
 
-# Настройка DNS (Указываем на HQ-SRV, как в 1 модуле)
-echo "nameserver $IP_HQ_SRV" > /etc/resolv.conf
-# Страховка для realm join, если DNS не успел подхватить зону
+# Сначала правим hosts и resolv, чтобы realm видел домен
 echo "$IP_BR_SRV br-srv.hq.local hq.local" >> /etc/hosts
+echo "nameserver $IP_BR_SRV" > /etc/resolv.conf
 
-# Запуск NFS клиента (исправление rpc.statd)
+# Поднимаем NFS
 systemctl enable --now rpcbind
 systemctl enable --now nfs-common 2>/dev/null || systemctl enable --now nfs-client 2>/dev/null || true
 
@@ -402,16 +385,14 @@ systemctl enable --now nfs-common 2>/dev/null || systemctl enable --now nfs-clie
 echo "$AD_ADMIN_PASS" | realm join -U Administrator --client-software=sssd $AD_REALM || true
 realm permit --groups $HQ_GROUP
 
-# Ограниченный sudo
 echo "%$HQ_GROUP ALL=(ALL) NOPASSWD: /bin/cat, /bin/grep, /bin/id" > /etc/sudoers.d/hq_restricted
 chmod 440 /etc/sudoers.d/hq_restricted
 
-# Монтирование NFS
+# NFS с nolock (чтобы не падало из-за rpc.statd)
 mkdir -p $CLI_NFS_MOUNT
-grep -q "$IP_HQ_SRV:$NFS_EXPORT_DIR" /etc/fstab || echo "$IP_HQ_SRV:$NFS_EXPORT_DIR $CLI_NFS_MOUNT nfs defaults,_netdev 0 0" >> /etc/fstab
-mount -a
+grep -q "$IP_HQ_SRV:$NFS_EXPORT_DIR" /etc/fstab || echo "$IP_HQ_SRV:$NFS_EXPORT_DIR $CLI_NFS_MOUNT nfs defaults,_netdev,nolock 0 0" >> /etc/fstab
+mount -a || true
 
-# Yandex Browser
 apt-get install -y yandex-browser-stable 2>/dev/null || true
 EOF
 
@@ -419,13 +400,14 @@ EOF
         ANSIBLE_STDOUT_CALLBACK=minimal ansible targets -m ping || true
         hist "ansible targets -m ping"
 
-        # --- ОЧИСТКА И ПЕРЕЗАГРУЗКА ---
         log "Очистка истории и перезагрузка всех машин (BR-SRV последним)..."
 
         local targets=("net_admin@$IP_ISP_EXT:22" "sshuser@$IP_HQ_SRV:$SSH_PORT_HQ_SRV" "sshuser@$IP_HQ_CLI:22" "net_admin@$IP_HQ_RTR:22" "net_admin@$IP_BR_RTR:22")
 
         for t in "${targets[@]}"; do
             local u_host="${t%:*}" port="${t#*:}"
+            # Используем sshpass на случай, если ключи не сработали
+            sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "$u_host" "sudo nohup bash -c 'sleep 2; reboot' >/dev/null 2>&1 &" 2>/dev/null || \
             ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "$u_host" "sudo nohup bash -c 'sleep 2; reboot' >/dev/null 2>&1 &" || true
             sleep 1
         done
@@ -443,7 +425,6 @@ EOF
         reboot
     }
 
-    # --- ТОЧКА ВХОДА ---
     EFFECTIVE_ROLE="$(detect_role)"
     if [ "$EFFECTIVE_ROLE" = "br-srv" ]; then
         stage1_node_prepare_and_ssh
