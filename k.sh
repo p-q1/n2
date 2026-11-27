@@ -16,7 +16,9 @@ main() {
         return 1
     fi
 
+    # --- ДЕФОЛТНЫЕ ЗНАЧЕНИЯ ---
     local IP_ISP_EXT="172.16.1.1"
+    local IP_ISP_INT="172.16.2.1"
     local IP_HQ_RTR="172.16.1.2"
     local IP_BR_RTR="172.16.2.2"
 
@@ -99,7 +101,6 @@ main() {
         
         local pkgs="openssh-server openssh-clients sshpass python3 sudo nano curl wget ca-certificates chrony nftables iptables iproute2 util-linux"
         apt-get install -y $pkgs >/dev/null 2>&1
-        apt-get install -y krb5 2>/dev/null || apt-get install -y krb5-user 2>/dev/null || true
 
         if [[ "$hn" == *isp* ]] || [[ "$hn" == *rtr* ]]; then
             ssh_user="net_admin"
@@ -347,8 +348,9 @@ grep -q "^$NFS_EXPORT_DIR" /etc/exports || echo "$NFS_EXPORT_DIR $HQ_CLI_NET(rw,
 exportfs -ra
 systemctl restart nfs-server
 
-# Явное указание web-пакетов
-apt-get install -y apache2 mariadb-server php libapache2-mod-php php-mysql || apt-get install -y apache2 mariadb-server php8.2 libapache2-mod-php8.2 php8.2-mysql
+# Обход бага с пакетом php в Astra
+apt-get install -y apache2 mariadb-server || true
+apt-get install -y php8.3 php8.3-mysql libapache2-mod-php8.3 || apt-get install -y php8.2 php8.2-mysql libapache2-mod-php8.2 || true
 systemctl enable --now mariadb
 systemctl enable --now apache2
 
@@ -367,19 +369,15 @@ if [ -d /tmp/web_src ]; then
 fi
 EOF
 
-        log "[BR-SRV -> HQ-CLI] Ввод в домен, NFS, Yandex Browser..."
+        log "[BR-SRV -> HQ-CLI] Ввод в домен, NFS (GUI), Yandex Browser..."
         ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 22 "sshuser@$IP_HQ_CLI" "sudo bash -s" <<EOF
 apt-get update -y
-# В Astra пакет называется krb5, а не krb5-user
-apt-get install -y realmd sssd sssd-ad adcli krb5 nfs-common rpcbind
+# Установка krb5 (в Astra он может называться просто krb5, либо быть в составе базовых)
+apt-get install -y realmd sssd sssd-ad adcli krb5 rpcbind || true
 
-# Сначала правим hosts и resolv, чтобы realm видел домен
+# Настройка сети до ввода в домен
 echo "$IP_BR_SRV br-srv.hq.local hq.local" >> /etc/hosts
 echo "nameserver $IP_BR_SRV" > /etc/resolv.conf
-
-# Поднимаем NFS
-systemctl enable --now rpcbind
-systemctl enable --now nfs-common 2>/dev/null || systemctl enable --now nfs-client 2>/dev/null || true
 
 # Ввод в домен
 echo "$AD_ADMIN_PASS" | realm join -U Administrator --client-software=sssd $AD_REALM || true
@@ -388,12 +386,38 @@ realm permit --groups $HQ_GROUP
 echo "%$HQ_GROUP ALL=(ALL) NOPASSWD: /bin/cat, /bin/grep, /bin/id" > /etc/sudoers.d/hq_restricted
 chmod 440 /etc/sudoers.d/hq_restricted
 
-# NFS с nolock (чтобы не падало из-за rpc.statd)
-mkdir -p $CLI_NFS_MOUNT
-grep -q "$IP_HQ_SRV:$NFS_EXPORT_DIR" /etc/fstab || echo "$IP_HQ_SRV:$NFS_EXPORT_DIR $CLI_NFS_MOUNT nfs defaults,_netdev,nolock 0 0" >> /etc/fstab
-mount -a || true
-
+# Браузер
 apt-get install -y yandex-browser-stable 2>/dev/null || true
+EOF
+
+        log "[BR-SRV] Создание закладки NFS в проводнике HQ-CLI..."
+        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 22 "sshuser@$IP_HQ_CLI" "sudo bash -s" <<EOF
+# Создаем скрипт для генерации закладки для всех пользователей
+cat > /usr/local/bin/setup_nfs_gui.sh <<'EOS'
+#!/bin/bash
+NFS_URI="nfs://$IP_HQ_SRV:2049$NFS_EXPORT_DIR"
+mkdir -p /etc/skel/.config/gtk-3.0
+mkdir -p /etc/skel/.local/share/gvfs-metadata
+cat > /etc/skel/.config/gtk-3.0/bookmarks <<BOOKMARK
+$NFS_URI NFS_Share
+BOOKMARK
+chmod 644 /etc/skel/.config/gtk-3.0/bookmarks
+
+# Применяем для текущих пользователей
+for USER_HOME in /home/*; do
+    USER_NAME=\$(basename "\$USER_HOME")
+    if [ -d "\$USER_HOME" ]; then
+        mkdir -p "\$USER_HOME/.config/gtk-3.0"
+        cat > "\$USER_HOME/.config/gtk-3.0/bookmarks" <<BOOKMARK
+$NFS_URI NFS_Share
+BOOKMARK
+        chown -R "\$USER_NAME:\$USER_NAME" "\$USER_HOME/.config/gtk-3.0"
+        chmod 644 "\$USER_HOME/.config/gtk-3.0/bookmarks"
+    fi
+done
+EOS
+chmod +x /usr/local/bin/setup_nfs_gui.sh
+/usr/local/bin/setup_nfs_gui.sh
 EOF
 
         log "Проверка Ansible..."
@@ -406,7 +430,6 @@ EOF
 
         for t in "${targets[@]}"; do
             local u_host="${t%:*}" port="${t#*:}"
-            # Используем sshpass на случай, если ключи не сработали
             sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "$u_host" "sudo nohup bash -c 'sleep 2; reboot' >/dev/null 2>&1 &" 2>/dev/null || \
             ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "$u_host" "sudo nohup bash -c 'sleep 2; reboot' >/dev/null 2>&1 &" || true
             sleep 1
