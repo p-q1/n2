@@ -16,7 +16,6 @@ main() {
         return 1
     fi
 
-    # --- ДЕФОЛТНЫЕ ЗНАЧЕНИЯ ---
     local IP_ISP_EXT="172.16.1.1"
     local IP_HQ_RTR="172.16.1.2"
     local IP_BR_RTR="172.16.2.2"
@@ -69,7 +68,6 @@ main() {
         fi
     }
 
-    # --- ИНТЕРАКТИВНЫЙ ВВОД ---
     clear
     echo "=== НАСТРОЙКА МОДУЛЯ 2 ==="
     local ROLE
@@ -355,16 +353,23 @@ if [ \${#DISK_ARR[@]} -ge 2 ]; then
     mount -a
 fi
 
-# Правильные пакеты для ALT Linux: nfs-server
-apt-get install -y nfs-server
-# Критически важно: разрешаем rpcbind слушать внешние подключения
+apt-get install -y nfs-server rpcbind
 control rpcbind server
 systemctl enable --now rpcbind
+systemctl restart rpcbind
 systemctl enable --now nfs-server
 mkdir -p $NFS_EXPORT_DIR && chmod 777 $NFS_EXPORT_DIR
 grep -q "^$NFS_EXPORT_DIR" /etc/exports || echo "$NFS_EXPORT_DIR $HQ_CLI_NET(rw,sync,no_subtree_check,no_root_squash,insecure)" >> /etc/exports
 exportfs -ra
 systemctl restart nfs-server
+
+# Открываем порты NFS в iptables, чтобы клиент мог подключиться
+iptables -I INPUT -p tcp --dport 111 -j ACCEPT 2>/dev/null || true
+iptables -I INPUT -p udp --dport 111 -j ACCEPT 2>/dev/null || true
+iptables -I INPUT -p tcp --dport 2049 -j ACCEPT 2>/dev/null || true
+iptables -I INPUT -p udp --dport 2049 -j ACCEPT 2>/dev/null || true
+iptables-save > /etc/sysconfig/iptables 2>/dev/null || iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+systemctl enable --now iptables 2>/dev/null || true
 
 # Веб-сервер и PHP для ALT Linux
 apt-get install -y httpd2 mariadb-server 2>/dev/null || apt-get install -y apache2 mariadb-server 2>/dev/null || true
@@ -395,34 +400,34 @@ EOF
         log "[BR-SRV -> HQ-CLI] Ввод в домен, NFS (GUI), Yandex Browser..."
         ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 22 "sshuser@$IP_HQ_CLI" "sudo bash -s" <<EOF
 apt-get update -y
-# Отключаем avahi-daemon, чтобы он не мешал разрешению домена .local
 systemctl stop avahi-daemon 2>/dev/null || true
 systemctl disable avahi-daemon 2>/dev/null || true
 
-# Пакеты для домена и NFS-клиента (в ALT Linux это nfs-clients)
 apt-get install -y realmd sssd sssd-ad adcli nfs-clients rpcbind 2>/dev/null || true
 
 echo "$IP_BR_SRV br-srv.hq.local hq.local" >> /etc/hosts
 echo "nameserver $IP_BR_SRV" > /etc/resolv.conf
 
+# Копируем корректный файл конфигурации Kerberos с KDC
+if [ -f /tmp/krb5.conf ]; then
+    cp -f /tmp/krb5.conf /etc/krb5.conf
+fi
+
 systemctl enable --now rpcbind
 systemctl enable --now nfs-client.target 2>/dev/null || systemctl enable --now nfs-client 2>/dev/null || true
 
-# Ввод в домен
 echo "$AD_ADMIN_PASS" | realm join -U Administrator --client-software=sssd $AD_REALM || true
 realm permit --groups $HQ_GROUP
 
 echo "%$HQ_GROUP ALL=(ALL) NOPASSWD: /bin/cat, /bin/grep, /bin/id" > /etc/sudoers.d/hq_restricted
 chmod 440 /etc/sudoers.d/hq_restricted
 
-# Автомонтирование NFS (с nolock для стабильности)
 mkdir -p $CLI_NFS_MOUNT
-grep -q "$IP_HQ_SRV:$NFS_EXPORT_DIR" /etc/fstab || echo "$IP_HQ_SRV:$NFS_EXPORT_DIR $CLI_NFS_MOUNT nfs defaults,_netdev,nolock,soft,intr 0 0" >> /etc/fstab
+grep -q "$IP_HQ_SRV:$NFS_EXPORT_DIR" /etc/fstab || echo "$IP_HQ_SRV:$NFS_EXPORT_DIR $CLI_NFS_MOUNT nfs nfsvers=3,intr,soft,nolock,_netdev 0 0" >> /etc/fstab
 mount -a || true
 
 apt-get install -y yandex-browser-stable 2>/dev/null || true
 
-# Закладка в GNOME (Nautilus)
 cat > /usr/local/bin/setup_nfs_gui.sh <<'EOS'
 #!/bin/bash
 NFS_URI="nfs://${IP_HQ_SRV}:2049${NFS_EXPORT_DIR}"
@@ -447,6 +452,9 @@ EOS
 chmod +x /usr/local/bin/setup_nfs_gui.sh
 /usr/local/bin/setup_nfs_gui.sh
 EOF
+
+        # Копируем сгенерированный Samba krb5.conf на клиент
+        scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P "22" /var/lib/samba/private/krb5.conf "sshuser@$IP_HQ_CLI:/tmp/krb5.conf" 2>/dev/null || true
 
         log "Проверка Ansible..."
         ANSIBLE_HOST_KEY_CHECKING=False ANSIBLE_STDOUT_CALLBACK=minimal ansible targets -m ping -e "ansible_password=$SSH_PASS" || true
