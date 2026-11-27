@@ -8,7 +8,7 @@ fi
 main() {
     set -u
     trap 'set +u' RETURN
-    
+
     export DEBIAN_FRONTEND=noninteractive
 
     if [ "$EUID" -ne 0 ]; then
@@ -86,7 +86,7 @@ main() {
 
         ISO_PATH=$(ask "Путь к Additional.iso" "$ISO_PATH")
         RAID_LEVEL=$(ask "Уровень RAID (0/1/5/6/10)" "$RAID_LEVEL")
-        
+
         case "$RAID_LEVEL" in
             0) log "Внимание: Для RAID 0 добавьте 2 диска!" ;;
             1) log "Внимание: Для RAID 1 добавьте 2 диска!" ;;
@@ -105,7 +105,7 @@ main() {
 
         log "[ЭТАП 1][$hn] Установка пакетов и настройка SSH..."
         apt-get update -y >/dev/null 2>&1
-        
+
         local pkgs="openssh-server openssh-clients sshpass python3 sudo nano curl wget ca-certificates chrony nftables iptables iproute2 util-linux"
         apt-get install -y $pkgs >/dev/null 2>&1
 
@@ -187,7 +187,7 @@ EOF
         log "[BR-SRV] Настройка Docker (testapp)..."
         apt-get install -y docker-engine docker-compose-v2 ansible 2>/dev/null || apt-get install -y docker docker-compose ansible
         systemctl enable --now docker
-        
+
         mkdir -p "$ISO_MOUNT"
         if [ -f "$ISO_PATH" ]; then
             mountpoint -q "$ISO_MOUNT" || mount -o loop "$ISO_PATH" "$ISO_MOUNT" || true
@@ -328,7 +328,7 @@ systemctl enable --now iptables 2>/dev/null || true
 EOF
 
         log "[BR-SRV -> HQ-SRV] RAID $RAID_LEVEL, NFS, Web..."
-        
+
         if [ -d "$ISO_MOUNT/web" ]; then
             sshpass -p "$SSH_PASS" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P "$SSH_PORT_HQ_SRV" -r "$ISO_MOUNT/web" "sshuser@$IP_HQ_SRV:/tmp/web_src" 2>/dev/null || true
         fi
@@ -353,6 +353,7 @@ if [ \${#DISK_ARR[@]} -ge 2 ]; then
     mount -a
 fi
 
+# NFS-сервер в ALT Linux: правильные пакеты и режим rpcbind
 apt-get install -y nfs-server rpcbind
 control rpcbind server
 systemctl enable --now rpcbind
@@ -363,7 +364,7 @@ grep -q "^$NFS_EXPORT_DIR" /etc/exports || echo "$NFS_EXPORT_DIR $HQ_CLI_NET(rw,
 exportfs -ra
 systemctl restart nfs-server
 
-# Открываем порты NFS в iptables, чтобы клиент мог подключиться
+# Открываем порты NFS в iptables
 iptables -I INPUT -p tcp --dport 111 -j ACCEPT 2>/dev/null || true
 iptables -I INPUT -p udp --dport 111 -j ACCEPT 2>/dev/null || true
 iptables -I INPUT -p tcp --dport 2049 -j ACCEPT 2>/dev/null || true
@@ -386,10 +387,10 @@ if [ -d /tmp/web_src ]; then
     mysql -e "GRANT ALL PRIVILEGES ON webdb.* TO 'web'@'%' IDENTIFIED BY 'P@ssw0rd';"
     mysql -e "FLUSH PRIVILEGES;"
     [ -f /tmp/web_src/dump.sql ] && mysql webdb < /tmp/web_src/dump.sql
-    
+
     WEB_DIR="/var/www/html"
     [ -d /var/www/httpd2/htdocs ] && WEB_DIR="/var/www/httpd2/htdocs"
-    
+
     cp -f /tmp/web_src/index.php \$WEB_DIR/
     cp -f /tmp/web_src/logo.png \$WEB_DIR/
     sed -i 's/DB_USER_HERE/web/g; s/DB_PASS_HERE/P@ssw0rd/g; s/DB_NAME_HERE/webdb/g' \$WEB_DIR/index.php
@@ -398,39 +399,55 @@ fi
 EOF
 
         log "[BR-SRV -> HQ-CLI] Ввод в домен, NFS (GUI), Yandex Browser..."
+
+        # Сначала копируем krb5.conf с Samba DC на клиент
+        if [ -f /var/lib/samba/private/krb5.conf ]; then
+            sshpass -p "$SSH_PASS" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P "22" /var/lib/samba/private/krb5.conf "sshuser@$IP_HQ_CLI:/tmp/krb5.conf" 2>/dev/null || true
+        fi
+
         ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 22 "sshuser@$IP_HQ_CLI" "sudo bash -s" <<EOF
 apt-get update -y
 systemctl stop avahi-daemon 2>/dev/null || true
 systemctl disable avahi-daemon 2>/dev/null || true
 
-apt-get install -y realmd sssd sssd-ad adcli nfs-clients rpcbind 2>/dev/null || true
+# Устанавливаем krb5 (в ALT Linux может называться krb5 или krb5-utils)
+apt-get install -y realmd sssd sssd-ad adcli nfs-clients rpcbind krb5 2>/dev/null || apt-get install -y realmd sssd sssd-ad adcli nfs-clients rpcbind krb5-utils 2>/dev/null || true
 
+# Настройка DNS
 echo "$IP_BR_SRV br-srv.hq.local hq.local" >> /etc/hosts
 echo "nameserver $IP_BR_SRV" > /etc/resolv.conf
 
-# Копируем корректный файл конфигурации Kerberos с KDC
+# Настройка Kerberos из скопированного файла
 if [ -f /tmp/krb5.conf ]; then
     cp -f /tmp/krb5.conf /etc/krb5.conf
+    # Принудительно включаем поиск KDC через DNS (для домена .local)
+    sed -i 's/dns_lookup_kdc = false/dns_lookup_kdc = true/' /etc/krb5.conf 2>/dev/null || true
+    sed -i 's/dns_lookup_realm = true/dns_lookup_realm = false/' /etc/krb5.conf 2>/dev/null || true
 fi
 
 systemctl enable --now rpcbind
 systemctl enable --now nfs-client.target 2>/dev/null || systemctl enable --now nfs-client 2>/dev/null || true
 
+# Ввод в домен
 echo "$AD_ADMIN_PASS" | realm join -U Administrator --client-software=sssd $AD_REALM || true
 realm permit --groups $HQ_GROUP
 
 echo "%$HQ_GROUP ALL=(ALL) NOPASSWD: /bin/cat, /bin/grep, /bin/id" > /etc/sudoers.d/hq_restricted
 chmod 440 /etc/sudoers.d/hq_restricted
 
+# Монтирование NFS (используем nfsvers=3 для совместимости)
 mkdir -p $CLI_NFS_MOUNT
 grep -q "$IP_HQ_SRV:$NFS_EXPORT_DIR" /etc/fstab || echo "$IP_HQ_SRV:$NFS_EXPORT_DIR $CLI_NFS_MOUNT nfs nfsvers=3,intr,soft,nolock,_netdev 0 0" >> /etc/fstab
 mount -a || true
 
 apt-get install -y yandex-browser-stable 2>/dev/null || true
 
+# Установка бэкенда GVFS для NFS и создание закладки
+apt-get install -y gvfs-backend-nfs 2>/dev/null || true
 cat > /usr/local/bin/setup_nfs_gui.sh <<'EOS'
 #!/bin/bash
-NFS_URI="nfs://${IP_HQ_SRV}:2049${NFS_EXPORT_DIR}"
+# В ALT Linux URI для Nautilus формируется без порта (по умолчанию 2049)
+NFS_URI="nfs://${IP_HQ_SRV}${NFS_EXPORT_DIR}"
 mkdir -p /etc/skel/.config/gtk-3.0
 cat > /etc/skel/.config/gtk-3.0/bookmarks <<BOOKMARK
 \$NFS_URI NFS_Share
@@ -452,9 +469,6 @@ EOS
 chmod +x /usr/local/bin/setup_nfs_gui.sh
 /usr/local/bin/setup_nfs_gui.sh
 EOF
-
-        # Копируем сгенерированный Samba krb5.conf на клиент
-        scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P "22" /var/lib/samba/private/krb5.conf "sshuser@$IP_HQ_CLI:/tmp/krb5.conf" 2>/dev/null || true
 
         log "Проверка Ansible..."
         ANSIBLE_HOST_KEY_CHECKING=False ANSIBLE_STDOUT_CALLBACK=minimal ansible targets -m ping -e "ansible_password=$SSH_PASS" || true
