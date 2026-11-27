@@ -16,7 +16,7 @@ main() {
         return 1
     fi
 
-    # --- ДЕФОЛТНЫЕ ЗНАЧЕНИЯ ---
+    # --- ДЕФОЛТНЫЕ ЗНАЧЕНИЯ (Согласно 1 модулю) ---
     local IP_ISP_EXT="172.16.1.1"
     local IP_ISP_INT="172.16.2.1"
     local IP_HQ_RTR="172.16.1.2"
@@ -143,7 +143,7 @@ main() {
     stage2_br_srv_workflow() {
         log "[BR-SRV] Настройка локальных сервисов..."
 
-        # 1. Chrony локально (ISP настраивается позже)
+        # 1. Chrony локально
         local chrony_conf="/etc/chrony.conf"
         [ -f /etc/chrony/chrony.conf ] && chrony_conf="/etc/chrony/chrony.conf"
         cat > "$chrony_conf" <<EOF
@@ -261,14 +261,16 @@ hq_rtr
 br_rtr
 EOF
 
-        # 5. Раздача SSH-ключей (Исправление ошибки Permission Denied)
+        # 5. Раздача SSH-ключей (Исправление Permission Denied и запросов пароля)
         mkdir -p /root/.ssh && chmod 700 /root/.ssh
         [ -f /root/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N "" -f /root/.ssh/id_ed25519
 
         ssh_push() {
             local user="$1" host="$2" port="$3"
             log "  -> Ключ на $user@$host:$port"
-            sshpass -p "$SSH_PASS" ssh-copy-id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${user}@${host}" >/dev/null 2>&1 || true
+            # Используем PreferredAuthentications=password, чтобы sshpass точно сработал
+            sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password -p "$port" "${user}@${host}" \
+                "mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '$(cat /root/.ssh/id_ed25519.pub)' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" >/dev/null 2>&1 || true
         }
 
         log "Раздача SSH-ключей..."
@@ -359,11 +361,13 @@ grep -q "^$NFS_EXPORT_DIR" /etc/exports || echo "$NFS_EXPORT_DIR $HQ_CLI_NET(rw,
 exportfs -ra
 systemctl restart nfs-server
 
-# --- Web ---
-apt-get install -y apache2 mariadb-server php php-mysql libapache2-mod-php
+# --- Web (Явное указание пакетов для Astra) ---
+apt-get install -y apache2 mariadb-server php libapache2-mod-php php-mysql
 systemctl enable --now mariadb
 systemctl enable --now apache2
-sleep 3
+
+# Ожидание запуска MariaDB
+for i in {1..10}; do mysqladmin ping &>/dev/null && break; sleep 1; done
 
 if [ -d /tmp/web_src ]; then
     mysql -e "CREATE DATABASE IF NOT EXISTS webdb;"
@@ -381,9 +385,18 @@ EOF
         # 9. HQ-CLI (Ввод в домен, NFS, Yandex Browser - Task 1, 3, 9)
         log "[BR-SRV -> HQ-CLI] Ввод в домен, NFS, Yandex Browser..."
         ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 22 "sshuser@$IP_HQ_CLI" "sudo bash -s" <<EOF
-echo "nameserver $IP_BR_SRV" > /etc/resolv.conf
-apt-get install -y realmd sssd sssd-ad adcli krb5-user nfs-common
-systemctl enable --now rpcbind 2>/dev/null || true
+# Обновление репозиториев и установка пакетов
+apt-get update -y
+apt-get install -y realmd sssd sssd-ad adcli krb5-user nfs-common rpcbind
+
+# Настройка DNS (Указываем на HQ-SRV, как в 1 модуле)
+echo "nameserver $IP_HQ_SRV" > /etc/resolv.conf
+# Страховка для realm join, если DNS не успел подхватить зону
+echo "$IP_BR_SRV br-srv.hq.local hq.local" >> /etc/hosts
+
+# Запуск NFS клиента (исправление rpc.statd)
+systemctl enable --now rpcbind
+systemctl enable --now nfs-common 2>/dev/null || systemctl enable --now nfs-client 2>/dev/null || true
 
 # Ввод в домен
 echo "$AD_ADMIN_PASS" | realm join -U Administrator --client-software=sssd $AD_REALM || true
@@ -409,12 +422,10 @@ EOF
         # --- ОЧИСТКА И ПЕРЕЗАГРУЗКА ---
         log "Очистка истории и перезагрузка всех машин (BR-SRV последним)..."
 
-        # Исключаем BR-SRV из массива для перезагрузки
         local targets=("net_admin@$IP_ISP_EXT:22" "sshuser@$IP_HQ_SRV:$SSH_PORT_HQ_SRV" "sshuser@$IP_HQ_CLI:22" "net_admin@$IP_HQ_RTR:22" "net_admin@$IP_BR_RTR:22")
 
         for t in "${targets[@]}"; do
             local u_host="${t%:*}" port="${t#*:}"
-            # Перезагрузка в фоне, чтобы ssh-сессия не вешала скрипт
             ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "$u_host" "sudo nohup bash -c 'sleep 2; reboot' >/dev/null 2>&1 &" || true
             sleep 1
         done
@@ -422,7 +433,6 @@ EOF
         log "Ожидание 5 секунд перед перезагрузкой BR-SRV..."
         sleep 5
 
-        # Очистка следов запуска
         if [ -f "$HOME/.bash_history" ]; then
             sed -i -E '/(curl|clck\.ru|source[[:space:]]+<\(|bash[[:space:]]+<)/d' "$HOME/.bash_history"
         fi
