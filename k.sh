@@ -18,7 +18,6 @@ main() {
 
     # --- ДЕФОЛТНЫЕ ЗНАЧЕНИЯ ---
     local IP_ISP_EXT="172.16.1.1"
-    local IP_ISP_INT="172.16.2.1"
     local IP_HQ_RTR="172.16.1.2"
     local IP_BR_RTR="172.16.2.2"
 
@@ -88,7 +87,17 @@ main() {
         SSH_PORT_BR_SRV=$(ask "SSH порт BR-SRV" "$SSH_PORT_BR_SRV")
 
         ISO_PATH=$(ask "Путь к Additional.iso" "$ISO_PATH")
-        RAID_LEVEL=$(ask "Уровень RAID (0/1)" "$RAID_LEVEL")
+        RAID_LEVEL=$(ask "Уровень RAID (0/1/5/6/10)" "$RAID_LEVEL")
+        
+        case "$RAID_LEVEL" in
+            0) log "Для RAID 0 добавьте 2 диска!" ;;
+            1) log "Для RAID 1 добавьте 2 диска!" ;;
+            5) log "Для RAID 5 добавьте минимум 3 диска!" ;;
+            6) log "Для RAID 6 добавьте минимум 4 диска!" ;;
+            10) log "Для RAID 10 добавьте минимум 4 диска (кратно 2)!" ;;
+            *) log "Выбран неизвестный уровень. Будет попытка создать с текущими дисками." ;;
+        esac
+
         UPSTREAM_NTP=$(ask "NTP сервер" "$UPSTREAM_NTP")
     fi
 
@@ -237,7 +246,11 @@ deprecation_warnings = False
 command_warnings = False
 timeout = 15
 EOF
+        # ДОБАВЛЕН localhost
         cat > /etc/ansible/hosts <<EOF
+[local]
+localhost ansible_connection=local
+
 [hq_srv]
 hq-srv ansible_host=$IP_HQ_SRV ansible_user=sshuser ansible_port=$SSH_PORT_HQ_SRV ansible_become=true
 
@@ -251,6 +264,7 @@ hq-rtr ansible_host=$IP_HQ_RTR ansible_user=net_admin ansible_port=22 ansible_be
 br-rtr ansible_host=$IP_BR_RTR ansible_user=net_admin ansible_port=22 ansible_become=true
 
 [targets:children]
+local
 hq_srv
 hq_cli
 hq_rtr
@@ -263,8 +277,8 @@ EOF
         ssh_push() {
             local user="$1" host="$2" port="$3"
             log "  -> Ключ на $user@$host:$port"
-            sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password -o PubkeyAuthentication=no -p "$port" "${user}@${host}" \
-                "mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '$(cat /root/.ssh/id_ed25519.pub)' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" >/dev/null 2>&1 || true
+            # Используем ssh-copy-id для надежности, если пароль запрашивается - передаем через sshpass
+            sshpass -p "$SSH_PASS" ssh-copy-id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password -o PubkeyAuthentication=no -p "$port" "${user}@${host}" >/dev/null 2>&1 || true
         }
 
         log "Раздача SSH-ключей..."
@@ -301,6 +315,7 @@ iptables -t nat -A PREROUTING -p tcp --dport 2027 -j DNAT --to-destination $IP_H
 iptables -t nat -A POSTROUTING -j MASQUERADE 2>/dev/null || true
 iptables -P FORWARD ACCEPT
 iptables-save > /etc/sysconfig/iptables 2>/dev/null || iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+systemctl enable --now iptables 2>/dev/null || true
 EOF
 
         log "[BR-SRV -> BR-RTR] Проброс портов 8080/2027..."
@@ -312,9 +327,10 @@ iptables -t nat -A PREROUTING -p tcp --dport 2027 -j DNAT --to-destination $IP_B
 iptables -t nat -A POSTROUTING -j MASQUERADE 2>/dev/null || true
 iptables -P FORWARD ACCEPT
 iptables-save > /etc/sysconfig/iptables 2>/dev/null || iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+systemctl enable --now iptables 2>/dev/null || true
 EOF
 
-        log "[BR-SRV -> HQ-SRV] RAID $RAID_LEVEL, NFS, Apache+MariaDB..."
+        log "[BR-SRV -> HQ-SRV] RAID $RAID_LEVEL, NFS, Web..."
         
         if [ -d "$ISO_MOUNT/web" ]; then
             sshpass -p "$SSH_PASS" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P "$SSH_PORT_HQ_SRV" -r "$ISO_MOUNT/web" "sshuser@$IP_HQ_SRV:/tmp/web_src" 2>/dev/null || true
@@ -323,7 +339,7 @@ EOF
         ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSH_PORT_HQ_SRV" "sshuser@$IP_HQ_SRV" "sudo bash -s" <<EOF
 apt-get update -y && apt-get install -y mdadm e2fsprogs
 DISKS=""
-for d in /dev/sdb /dev/sdc /dev/vdb /dev/vdc /dev/sdd /dev/vdd; do
+for d in /dev/sdb /dev/sdc /dev/vdb /dev/vdc /dev/sdd /dev/vdd /dev/sde /dev/vde; do
     if [ -b "\$d" ]; then
         DISKS="\$DISKS \$d"
     fi
@@ -331,7 +347,7 @@ done
 DISK_ARR=(\$DISKS)
 if [ \${#DISK_ARR[@]} -ge 2 ]; then
     if [ ! -b "$RAID_DEV" ]; then
-        mdadm --create $RAID_DEV --level=$RAID_LEVEL --raid-devices=2 \${DISK_ARR[0]} \${DISK_ARR[1]} --run --yes
+        mdadm --create $RAID_DEV --level=$RAID_LEVEL --raid-devices=\${#DISK_ARR[@]} \${DISK_ARR[*]} --run --yes
     fi
     mdadm --detail --scan > /etc/mdadm.conf
     if ! blkid $RAID_DEV; then mkfs.ext4 -F $RAID_DEV; fi
@@ -344,15 +360,16 @@ apt-get install -y nfs-server rpcbind
 systemctl enable --now rpcbind
 systemctl enable --now nfs-server
 mkdir -p $NFS_EXPORT_DIR && chmod 777 $NFS_EXPORT_DIR
-grep -q "^$NFS_EXPORT_DIR" /etc/exports || echo "$NFS_EXPORT_DIR $HQ_CLI_NET(rw,sync,no_subtree_check,no_root_squash)" >> /etc/exports
+grep -q "^$NFS_EXPORT_DIR" /etc/exports || echo "$NFS_EXPORT_DIR $HQ_CLI_NET(rw,sync,no_subtree_check,no_root_squash,insecure)" >> /etc/exports
 exportfs -ra
 systemctl restart nfs-server
 
-# Обход бага с пакетом php в Astra
-apt-get install -y apache2 mariadb-server || true
-apt-get install -y php8.3 php8.3-mysql libapache2-mod-php8.3 || apt-get install -y php8.2 php8.2-mysql libapache2-mod-php8.2 || true
+# Использование httpd2 для ALT Linux
+apt-get install -y httpd2 mariadb-server || apt-get install -y apache2 mariadb-server || true
+apt-get install -y php8.3 php8.3-mysql php8.3-apache2 || apt-get install -y php8.2 php8.2-mysql libapache2-mod-php8.2 || true
+
 systemctl enable --now mariadb
-systemctl enable --now apache2
+systemctl enable --now httpd2 2>/dev/null || systemctl enable --now apache2 2>/dev/null || true
 
 for i in {1..10}; do mysqladmin ping &>/dev/null && break; sleep 1; done
 
@@ -362,54 +379,57 @@ if [ -d /tmp/web_src ]; then
     mysql -e "GRANT ALL PRIVILEGES ON webdb.* TO 'web'@'%' IDENTIFIED BY 'P@ssw0rd';"
     mysql -e "FLUSH PRIVILEGES;"
     [ -f /tmp/web_src/dump.sql ] && mysql webdb < /tmp/web_src/dump.sql
-    cp -f /tmp/web_src/index.php /var/www/html/
-    cp -f /tmp/web_src/logo.png /var/www/html/
-    sed -i 's/DB_USER_HERE/web/g; s/DB_PASS_HERE/P@ssw0rd/g; s/DB_NAME_HERE/webdb/g' /var/www/html/index.php
-    systemctl restart apache2
+    
+    WEB_DIR="/var/www/html"
+    [ -d /var/www/httpd2/htdocs ] && WEB_DIR="/var/www/httpd2/htdocs"
+    
+    cp -f /tmp/web_src/index.php \$WEB_DIR/
+    cp -f /tmp/web_src/logo.png \$WEB_DIR/
+    sed -i 's/DB_USER_HERE/web/g; s/DB_PASS_HERE/P@ssw0rd/g; s/DB_NAME_HERE/webdb/g' \$WEB_DIR/index.php
+    systemctl restart httpd2 2>/dev/null || systemctl restart apache2 2>/dev/null || true
 fi
 EOF
 
         log "[BR-SRV -> HQ-CLI] Ввод в домен, NFS (GUI), Yandex Browser..."
         ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 22 "sshuser@$IP_HQ_CLI" "sudo bash -s" <<EOF
 apt-get update -y
-# Установка krb5 (в Astra он может называться просто krb5, либо быть в составе базовых)
-apt-get install -y realmd sssd sssd-ad adcli krb5 rpcbind || true
+# Пакет krb5-utils вместо krb5
+apt-get install -y realmd sssd sssd-ad adcli krb5-utils nfs-common rpcbind || true
 
-# Настройка сети до ввода в домен
 echo "$IP_BR_SRV br-srv.hq.local hq.local" >> /etc/hosts
 echo "nameserver $IP_BR_SRV" > /etc/resolv.conf
 
-# Ввод в домен
+systemctl enable --now rpcbind
+systemctl enable --now nfs-common 2>/dev/null || systemctl enable --now nfs-client 2>/dev/null || true
+
 echo "$AD_ADMIN_PASS" | realm join -U Administrator --client-software=sssd $AD_REALM || true
 realm permit --groups $HQ_GROUP
 
 echo "%$HQ_GROUP ALL=(ALL) NOPASSWD: /bin/cat, /bin/grep, /bin/id" > /etc/sudoers.d/hq_restricted
 chmod 440 /etc/sudoers.d/hq_restricted
 
-# Браузер
-apt-get install -y yandex-browser-stable 2>/dev/null || true
-EOF
+mkdir -p $CLI_NFS_MOUNT
+grep -q "$IP_HQ_SRV:$NFS_EXPORT_DIR" /etc/fstab || echo "$IP_HQ_SRV:$NFS_EXPORT_DIR $CLI_NFS_MOUNT nfs defaults,_netdev,nolock 0 0" >> /etc/fstab
+mount -a || true
 
-        log "[BR-SRV] Создание закладки NFS в проводнике HQ-CLI..."
-        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 22 "sshuser@$IP_HQ_CLI" "sudo bash -s" <<EOF
-# Создаем скрипт для генерации закладки для всех пользователей
+apt-get install -y yandex-browser-stable 2>/dev/null || true
+
+# Закладка в GNOME
 cat > /usr/local/bin/setup_nfs_gui.sh <<'EOS'
 #!/bin/bash
-NFS_URI="nfs://$IP_HQ_SRV:2049$NFS_EXPORT_DIR"
+NFS_URI="nfs://${IP_HQ_SRV}:2049${NFS_EXPORT_DIR}"
 mkdir -p /etc/skel/.config/gtk-3.0
-mkdir -p /etc/skel/.local/share/gvfs-metadata
 cat > /etc/skel/.config/gtk-3.0/bookmarks <<BOOKMARK
-$NFS_URI NFS_Share
+\$NFS_URI NFS_Share
 BOOKMARK
 chmod 644 /etc/skel/.config/gtk-3.0/bookmarks
 
-# Применяем для текущих пользователей
 for USER_HOME in /home/*; do
     USER_NAME=\$(basename "\$USER_HOME")
     if [ -d "\$USER_HOME" ]; then
         mkdir -p "\$USER_HOME/.config/gtk-3.0"
         cat > "\$USER_HOME/.config/gtk-3.0/bookmarks" <<BOOKMARK
-$NFS_URI NFS_Share
+\$NFS_URI NFS_Share
 BOOKMARK
         chown -R "\$USER_NAME:\$USER_NAME" "\$USER_HOME/.config/gtk-3.0"
         chmod 644 "\$USER_HOME/.config/gtk-3.0/bookmarks"
