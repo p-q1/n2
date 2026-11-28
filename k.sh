@@ -1,5 +1,4 @@
 #!/bin/bash
-# Модуль 2 — Демо 2027 (ALT Linux)
 # Порядок запуска: сначала на всех узлах КРОМЕ BR-SRV, в самом конце — на BR-SRV.
 # Запуск: source /путь/к/скрипту.sh
 
@@ -40,6 +39,7 @@ mod2_run() {
 
     local RAID_DEV="/dev/md0"
     local RAID_LEVEL="0"
+    local RAID_FS="ext4"
     local RAID_MOUNT="/raid"
     local NFS_EXPORT_DIR="/raid/nfs"
     local CLI_NFS_MOUNT="/mnt/nfs"
@@ -59,6 +59,10 @@ mod2_run() {
         printf '\033[1;33m[%s] [WARN] %s\033[0m\n' "$(date '+%H:%M:%S')" "$*"
     }
 
+    info_line() {
+        printf '\033[0;37m[%s]        %s\033[0m\n' "$(date '+%H:%M:%S')" "$*"
+    }
+
     summary_block() {
         local title="$1"
         shift
@@ -72,20 +76,43 @@ mod2_run() {
         echo "${answer:-$default_val}"
     }
 
+    raid_min_disks() {
+        case "$1" in
+            0|1) echo "2" ;;
+            5)   echo "3" ;;
+            6|10) echo "4" ;;
+            *)   echo "2" ;;
+        esac
+    }
+
+    raid_reqs_note() {
+        case "$1" in
+            0)  echo "RAID 0: минимум 2 диска (полоскование, без отказоустойчивости; по заданию — 2x1 ГБ)." ;;
+            1)  echo "RAID 1: минимум 2 диска (зеркалирование, кратно 1)." ;;
+            5)  echo "RAID 5: минимум 3 диска (распределённая чётность)." ;;
+            6)  echo "RAID 6: минимум 4 диска (двойная чётность)." ;;
+            10) echo "RAID 10: минимум 4 диска, чётное количество (зеркало поверх страйпа)." ;;
+            *)  echo "Уровень не распознан — проверьте значение (0, 1, 5, 6, 10)." ;;
+        esac
+    }
+
     save_history_clean() {
         local hist_file="${HISTFILE:-$HOME/.bash_history}"
         history -a 2>/dev/null || true
         history -w "$hist_file" 2>/dev/null || true
 
         if [ -f "$hist_file" ]; then
-            local tmp_hist
-            tmp_hist="$(mktemp)"
-            grep -vE '(curl|source[[:space:]]+<\(|bash[[:space:]]+<|модуль2|mod2)' "$hist_file" > "$tmp_hist" || true
+            local tmp1 tmp2
+            tmp1="$(mktemp)"
+            tmp2="$(mktemp)"
+            grep -vE '(curl|source[[:space:]]+<\(|bash[[:space:]]+<|модуль2|mod2)' "$hist_file" > "$tmp1" || true
             if [ -n "$INVOCATION_CMD" ]; then
-                grep -vF "$INVOCATION_CMD" "$tmp_hist" > "${tmp_hist}.2" || true
-                mv "${tmp_hist}.2" "$tmp_hist"
+                grep -vF "$INVOCATION_CMD" "$tmp1" > "$tmp2" || true
+            else
+                cp -f "$tmp1" "$tmp2"
             fi
-            mv "$tmp_hist" "$hist_file"
+            \mv -f "$tmp2" "$hist_file"
+            rm -f "$tmp1" "$tmp2" 2>/dev/null || true
         fi
 
         history -c 2>/dev/null || true
@@ -117,6 +144,8 @@ mod2_run() {
         modprobe nfsv3 2>/dev/null || true
         modprobe raid0 2>/dev/null || true
         modprobe raid1 2>/dev/null || true
+        modprobe raid456 2>/dev/null || true
+        modprobe raid10 2>/dev/null || true
 
         if [[ "${hn,,}" == *isp* ]] || [[ "${hn,,}" == *rtr* ]]; then
             ssh_user="net_admin"
@@ -164,6 +193,20 @@ mod2_run() {
         systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
     }
 
+    ssh_key_only() {
+        local port="$1" target="$2"
+        shift 2
+        ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=6 -p "$port" "$target" "$@"
+    }
+
+    scp_key_only() {
+        local port="$1"
+        shift
+        scp -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=6 -P "$port" "$@"
+    }
+
     run_br_srv_orchestration() {
         clear
         echo "=== МОДУЛЬ 2: ЦЕНТРАЛЬНАЯ НАСТРОЙКА С BR-SRV ==="
@@ -179,6 +222,20 @@ mod2_run() {
         ISO_PATH=$(ask "Путь к Additional.iso" "$ISO_PATH")
         UPSTREAM_NTP=$(ask "Вышестоящий NTP для ISP" "$UPSTREAM_NTP")
 
+        printf '\n\033[1;33mПримечание по RAID на HQ-SRV:\033[0m\n'
+        echo "  - RAID 0: минимум 2 диска"
+        echo "  - RAID 1: минимум 2 диска"
+        echo "  - RAID 5: минимум 3 диска"
+        echo "  - RAID 6: минимум 4 диска"
+        echo "  - RAID 10: минимум 4 диска (чётное число)"
+        RAID_LEVEL=$(ask "Уровень RAID для HQ-SRV (0/1/5/6/10)" "$RAID_LEVEL")
+        info_line "$(raid_reqs_note "$RAID_LEVEL")"
+        RAID_FS=$(ask "Файловая система RAID (ext4/xfs/btrfs)" "$RAID_FS")
+        case "${RAID_FS,,}" in
+            ext4|xfs|btrfs) RAID_FS="${RAID_FS,,}" ;;
+            *) warn "Неизвестная ФС '$RAID_FS', используется ext4"; RAID_FS="ext4" ;;
+        esac
+
         # 1. Монтируем Additional.iso
         mkdir -p "$ISO_MOUNT"
         if [ -f "$ISO_PATH" ]; then
@@ -187,14 +244,15 @@ mod2_run() {
             mountpoint -q "$ISO_MOUNT" || mount -o ro /dev/sr0 "$ISO_MOUNT" || warn "Не удалось смонтировать /dev/sr0"
         fi
 
-        # 2. Раздаём SSH-ключи
+        # 2. Раздаём SSH-ключи со всех узлов
         mkdir -p /root/.ssh && chmod 700 /root/.ssh
         [ -f /root/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N "" -f /root/.ssh/id_ed25519
 
         push_key() {
             local u="$1" h="$2" p="$3"
             sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-                -o PreferredAuthentications=password -o PubkeyAuthentication=no -p "$p" "${u}@${h}" \
+                -o NumberOfPasswordPrompts=1 -o ConnectTimeout=6 -o PreferredAuthentications=password \
+                -o PubkeyAuthentication=no -p "$p" "${u}@${h}" \
                 "mkdir -p ~/.ssh && chmod 700 ~/.ssh && grep -qxF '$(cat /root/.ssh/id_ed25519.pub)' ~/.ssh/authorized_keys 2>/dev/null || echo '$(cat /root/.ssh/id_ed25519.pub)' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" \
                 >/dev/null 2>&1 || true
         }
@@ -205,7 +263,7 @@ mod2_run() {
         push_key "net_admin" "$IP_HQ_RTR" "22"
         push_key "net_admin" "$IP_BR_RTR" "22"
 
-        # 3. [Задание 1 + Задание 6] Локальная настройка BR-SRV (Samba DC, Docker testapp, chrony)
+        # 3. [Задание 1 + Задание 6] Локальная настройка BR-SRV
         log "ПОДЛЮЧЕНИЕ BR-SRV (LOCAL)"
         local samba_ok="no" docker_ok="no" chrony_br_ok="no"
 
@@ -251,12 +309,12 @@ EOF
 
         summary_block "ПОДЛЮЧЕНИЕ BR-SRV (LOCAL)" "samba - $samba_ok, docker - $docker_ok, chrony - $chrony_br_ok"
 
-        # 4. [Задание 4] BR-SRV -> ISP (chrony stratum 5)
+        # 4. [Задание 4] BR-SRV -> ISP
         log "ПОДЛЮЧЕНИЕ BR-SRV -> ISP"
         local isp_ping="no" isp_chrony="no" isp_ipt="no"
         if ping -c 1 -W 2 "$IP_ISP_EXT" >/dev/null 2>&1; then isp_ping="yes"; fi
 
-        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 22 "net_admin@$IP_ISP_EXT" "sudo bash -s" <<EOF >/dev/null 2>&1 && isp_chrony="yes"
+        ssh_key_only "22" "net_admin@$IP_ISP_EXT" "sudo bash -s" <<EOF >/dev/null 2>&1 && isp_chrony="yes"
 set -e
 CHRONY_CONF="/etc/chrony.conf"
 [ -f /etc/chrony/chrony.conf ] && CHRONY_CONF="/etc/chrony/chrony.conf"
@@ -274,17 +332,15 @@ systemctl restart chronyd 2>/dev/null || systemctl restart chrony 2>/dev/null ||
 systemctl is-active --quiet chronyd || systemctl is-active --quiet chrony
 EOF
 
-        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 22 "net_admin@$IP_ISP_EXT" \
-            "sudo iptables -L >/dev/null 2>&1" >/dev/null 2>&1 && isp_ipt="yes"
-
+        ssh_key_only "22" "net_admin@$IP_ISP_EXT" "sudo iptables -L >/dev/null 2>&1" >/dev/null 2>&1 && isp_ipt="yes"
         summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> ISP" "chrony - $isp_chrony, ping - $isp_ping, iptables - $isp_ipt"
 
-        # 5. [Задание 8] BR-SRV -> HQ-RTR (DNAT 8080, 2027)
+        # 5. [Задание 8] BR-SRV -> HQ-RTR
         log "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-RTR"
         local hqrtr_ping="no" hqrtr_chrony="no" hqrtr_dnat="no"
         if ping -c 1 -W 2 "$IP_HQ_RTR" >/dev/null 2>&1; then hqrtr_ping="yes"; fi
 
-        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 22 "net_admin@$IP_HQ_RTR" "sudo bash -s" <<EOF >/dev/null 2>&1 && hqrtr_chrony="yes"
+        ssh_key_only "22" "net_admin@$IP_HQ_RTR" "sudo bash -s" <<EOF >/dev/null 2>&1 && hqrtr_chrony="yes"
 set -e
 CHRONY_CONF="/etc/chrony.conf"
 [ -f /etc/chrony/chrony.conf ] && CHRONY_CONF="/etc/chrony/chrony.conf"
@@ -299,7 +355,7 @@ systemctl restart chronyd 2>/dev/null || systemctl restart chrony 2>/dev/null ||
 systemctl is-active --quiet chronyd || systemctl is-active --quiet chrony
 EOF
 
-        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 22 "net_admin@$IP_HQ_RTR" "sudo bash -s" <<EOF >/dev/null 2>&1 && hqrtr_dnat="yes"
+        ssh_key_only "22" "net_admin@$IP_HQ_RTR" "sudo bash -s" <<EOF >/dev/null 2>&1 && hqrtr_dnat="yes"
 set -e
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
 grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
@@ -312,15 +368,14 @@ iptables -P FORWARD ACCEPT
 iptables-save > /etc/sysconfig/iptables 2>/dev/null || true
 systemctl enable --now iptables 2>/dev/null || true
 EOF
-
         summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-RTR" "chrony - $hqrtr_chrony, ping - $hqrtr_ping, dnat - $hqrtr_dnat"
 
-        # 6. [Задание 8] BR-SRV -> BR-RTR (DNAT 8080, 2027)
+        # 6. [Задание 8] BR-SRV -> BR-RTR
         log "ПОДЛЮЧЕНИЕ BR-SRV -> BR-RTR"
         local brrtr_ping="no" brrtr_chrony="no" brrtr_dnat="no"
         if ping -c 1 -W 2 "$IP_BR_RTR" >/dev/null 2>&1; then brrtr_ping="yes"; fi
 
-        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 22 "net_admin@$IP_BR_RTR" "sudo bash -s" <<EOF >/dev/null 2>&1 && brrtr_chrony="yes"
+        ssh_key_only "22" "net_admin@$IP_BR_RTR" "sudo bash -s" <<EOF >/dev/null 2>&1 && brrtr_chrony="yes"
 set -e
 CHRONY_CONF="/etc/chrony.conf"
 [ -f /etc/chrony/chrony.conf ] && CHRONY_CONF="/etc/chrony/chrony.conf"
@@ -335,7 +390,7 @@ systemctl restart chronyd 2>/dev/null || systemctl restart chrony 2>/dev/null ||
 systemctl is-active --quiet chronyd || systemctl is-active --quiet chrony
 EOF
 
-        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 22 "net_admin@$IP_BR_RTR" "sudo bash -s" <<EOF >/dev/null 2>&1 && brrtr_dnat="yes"
+        ssh_key_only "22" "net_admin@$IP_BR_RTR" "sudo bash -s" <<EOF >/dev/null 2>&1 && brrtr_dnat="yes"
 set -e
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
 grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
@@ -348,20 +403,20 @@ iptables -P FORWARD ACCEPT
 iptables-save > /etc/sysconfig/iptables 2>/dev/null || true
 systemctl enable --now iptables 2>/dev/null || true
 EOF
-
         summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> BR-RTR" "chrony - $brrtr_chrony, ping - $brrtr_ping, dnat - $brrtr_dnat"
 
-        # 7. [Задания 2, 3, 7] BR-SRV -> HQ-SRV (RAID 0, NFS, Apache + MariaDB)
+        # 7. [Задания 2, 3, 7] BR-SRV -> HQ-SRV (проверка дисков под RAID + ФС + NFS + Web)
         log "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-SRV"
         local hqsrv_ping="no" hqsrv_raid="no" hqsrv_nfs="no" hqsrv_web="no" hqsrv_chrony="no"
+        local min_req_disks
+        min_req_disks="$(raid_min_disks "$RAID_LEVEL")"
         if ping -c 1 -W 2 "$IP_HQ_SRV" >/dev/null 2>&1; then hqsrv_ping="yes"; fi
 
         if [ -d "$ISO_MOUNT/web" ]; then
-            scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P "$SSH_PORT_HQ_SRV" \
-                -r "$ISO_MOUNT/web" "sshuser@$IP_HQ_SRV:/tmp/web_src" >/dev/null 2>&1 || true
+            scp_key_only "$SSH_PORT_HQ_SRV" -r "$ISO_MOUNT/web" "sshuser@$IP_HQ_SRV:/tmp/web_src" >/dev/null 2>&1 || true
         fi
 
-        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSH_PORT_HQ_SRV" "sshuser@$IP_HQ_SRV" "sudo bash -s" <<EOF >/dev/null 2>&1 && hqsrv_chrony="yes"
+        ssh_key_only "$SSH_PORT_HQ_SRV" "sshuser@$IP_HQ_SRV" "sudo bash -s" <<EOF >/dev/null 2>&1 && hqsrv_chrony="yes"
 CHRONY_CONF="/etc/chrony.conf"
 [ -f /etc/chrony/chrony.conf ] && CHRONY_CONF="/etc/chrony/chrony.conf"
 cat > "\$CHRONY_CONF" <<CHR
@@ -374,46 +429,102 @@ systemctl enable --now chronyd 2>/dev/null || systemctl enable --now chrony 2>/d
 systemctl restart chronyd 2>/dev/null || systemctl restart chrony 2>/dev/null || true
 EOF
 
-        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSH_PORT_HQ_SRV" "sshuser@$IP_HQ_SRV" "sudo bash -s" <<EOF
-set -e
-apt-get update -y >/dev/null 2>&1
-apt-get install -y mdadm e2fsprogs nfs-server rpcbind >/dev/null 2>&1
+        local raid_diag
+        raid_diag="$(ssh_key_only "$SSH_PORT_HQ_SRV" "sshuser@$IP_HQ_SRV" "sudo bash -s" <<EOF 2>/dev/null || true
+apt-get update -y >/dev/null 2>&1 || true
+apt-get install -y mdadm e2fsprogs >/dev/null 2>&1 || true
+case "$RAID_FS" in
+    xfs)   apt-get install -y xfsprogs >/dev/null 2>&1 || true ;;
+    btrfs) apt-get install -y btrfsprogs >/dev/null 2>&1 || true ;;
+esac
 
 modprobe raid0 2>/dev/null || true
-DISKS=()
-for d in /dev/sdb /dev/sdc /dev/vdb /dev/vdc; do
-    if [ -b "\$d" ]; then DISKS+=("\$d"); fi
-done
-if [ \${#DISKS[@]} -ge 2 ]; then
-    if [ ! -b "$RAID_DEV" ]; then
-        mdadm --create "$RAID_DEV" --level=$RAID_LEVEL --raid-devices=\${#DISKS[@]} "\${DISKS[@]}" --run --yes >/dev/null
-    fi
-    mdadm --detail --scan > /etc/mdadm.conf
-    if ! blkid "$RAID_DEV" >/dev/null 2>&1; then
-        mkfs.ext4 -F "$RAID_DEV" >/dev/null
-    fi
-    mkdir -p "$RAID_MOUNT"
-    grep -q "^$RAID_DEV[[:space:]]" /etc/fstab || echo "$RAID_DEV $RAID_MOUNT ext4 defaults,nofail 0 2" >> /etc/fstab
-    mount -a
-fi
-mountpoint -q "$RAID_MOUNT" && echo "RAID_OK=yes" || echo "RAID_OK=no"
+modprobe raid1 2>/dev/null || true
+modprobe raid456 2>/dev/null || true
+modprobe raid10 2>/dev/null || true
 
+CANDIDATES=()
+for dev in /dev/sd[b-z] /dev/vd[b-z] /dev/xvd[b-z] /dev/nvme[1-9]n1; do
+    if [ -b "\$dev" ]; then
+        has_children=\$(lsblk -dn -o TYPE "\$dev" 2>/dev/null)
+        part_cnt=\$(lsblk -ln "\$dev" 2>/dev/null | awk '\$6=="part"{c++} END{print c+0}')
+        if ! findmnt -S "\$dev" >/dev/null 2>&1 && [ "\$part_cnt" -eq 0 ]; then
+            CANDIDATES+=("\$dev")
+        fi
+    fi
+done
+
+echo "CANDIDATES_LIST=\${CANDIDATES[*]:-none}"
+echo "CANDIDATES_COUNT=\${#CANDIDATES[@]}"
+
+RAID_READY="no"
+SELECTED=()
+if [ "$RAID_LEVEL" = "10" ]; then
+    if [ \${#CANDIDATES[@]} -ge $min_req_disks ] && [ $(( \${#CANDIDATES[@]} % 2 )) -eq 0 ]; then
+        SELECTED=("\${CANDIDATES[@]}")
+        RAID_READY="yes"
+    else
+        echo "RAID_REASON=нужно чётное число дисков >= $min_req_disks (найдено: \${#CANDIDATES[@]})"
+    fi
+else
+    if [ \${#CANDIDATES[@]} -ge $min_req_disks ]; then
+        SELECTED=("\${CANDIDATES[@]:0:$min_req_disks}")
+        RAID_READY="yes"
+    else
+        echo "RAID_REASON=недостаточно свободных дисков для RAID $RAID_LEVEL (нужно >= $min_req_disks, найдено: \${#CANDIDATES[@]})"
+    fi
+fi
+
+if [ "\$RAID_READY" = "yes" ]; then
+    echo "SELECTED_DISKS=\${SELECTED[*]}"
+    if [ ! -b "$RAID_DEV" ]; then
+        mdadm --create "$RAID_DEV" --level=$RAID_LEVEL --raid-devices=\${#SELECTED[@]} "\${SELECTED[@]}" --run --yes >/dev/null 2>&1 || true
+    fi
+    if [ -b "$RAID_DEV" ]; then
+        mdadm --detail --scan > /etc/mdadm.conf || true
+        if ! blkid "$RAID_DEV" >/dev/null 2>&1; then
+            case "$RAID_FS" in
+                xfs)   mkfs.xfs -f "$RAID_DEV" >/dev/null 2>&1 || true ;;
+                btrfs) mkfs.btrfs -f "$RAID_DEV" >/dev/null 2>&1 || true ;;
+                *)     mkfs.ext4 -F "$RAID_DEV" >/dev/null 2>&1 || true ;;
+            esac
+        fi
+        mkdir -p "$RAID_MOUNT"
+        grep -q "^$RAID_DEV[[:space:]]" /etc/fstab || echo "$RAID_DEV $RAID_MOUNT $RAID_FS defaults,nofail 0 2" >> /etc/fstab
+        mount -a || true
+    fi
+fi
+
+mountpoint -q "$RAID_MOUNT" && echo "RAID_OK=yes" || echo "RAID_OK=no"
+EOF
+)"
+        local c_list c_cnt s_disks r_reason
+        c_list="$(printf '%s\n' "$raid_diag" | awk -F= '/^CANDIDATES_LIST=/{print $2}')"
+        c_cnt="$(printf '%s\n' "$raid_diag" | awk -F= '/^CANDIDATES_COUNT=/{print $2}')"
+        s_disks="$(printf '%s\n' "$raid_diag" | awk -F= '/^SELECTED_DISKS=/{print $2}')"
+        r_reason="$(printf '%s\n' "$raid_diag" | awk -F= '/^RAID_REASON=/{print $2}')"
+        info_line "RAID проверка (уровень $RAID_LEVEL, мин. дисков: $min_req_disks, ФС: $RAID_FS): кандидаты=[${c_list:-none}] (кол-во: ${c_cnt:-0})"
+        [ -n "${s_disks:-}" ] && info_line "Выбранные диски для $RAID_DEV: $s_disks"
+        [ -n "${r_reason:-}" ] && warn "RAID не собран: $r_reason"
+        [[ "$raid_diag" == *"RAID_OK=yes"* ]] && hqsrv_raid="yes"
+
+        ssh_key_only "$SSH_PORT_HQ_SRV" "sshuser@$IP_HQ_SRV" "sudo bash -s" <<EOF >/dev/null 2>&1 || true
+apt-get install -y nfs-server rpcbind >/dev/null 2>&1 || true
 modprobe nfs 2>/dev/null || true
 modprobe nfsv3 2>/dev/null || true
 control rpcbind server 2>/dev/null || true
-systemctl enable --now rpcbind >/dev/null 2>&1
-systemctl restart rpcbind >/dev/null 2>&1
-systemctl enable --now nfs-server >/dev/null 2>&1
+systemctl enable --now rpcbind >/dev/null 2>&1 || true
+systemctl restart rpcbind >/dev/null 2>&1 || true
+systemctl enable --now nfs-server >/dev/null 2>&1 || true
 mkdir -p "$NFS_EXPORT_DIR" && chmod 777 "$NFS_EXPORT_DIR"
 grep -q "^$NFS_EXPORT_DIR[[:space:]]" /etc/exports || \
     echo "$NFS_EXPORT_DIR $HQ_CLI_NET(rw,sync,no_subtree_check,no_root_squash,insecure)" >> /etc/exports
-exportfs -ra >/dev/null 2>&1
-systemctl restart nfs-server >/dev/null 2>&1
-exportfs | grep -q "$NFS_EXPORT_DIR" && echo "NFS_OK=yes" || echo "NFS_OK=no"
+exportfs -ra >/dev/null 2>&1 || true
+systemctl restart nfs-server >/dev/null 2>&1 || true
 
 apt-get install -y httpd2 mariadb-server 2>/dev/null || apt-get install -y apache2 mariadb-server 2>/dev/null || true
 apt-get install -y php8.2 php8.2-mysql 2>/dev/null || apt-get install -y php php-mysql 2>/dev/null || true
-systemctl enable --now mariadb >/dev/null 2>&1
+systemctl enable --now mariadb >/dev/null 2>&1 || true
 systemctl enable --now httpd2 >/dev/null 2>&1 || systemctl enable --now apache2 >/dev/null 2>&1 || true
 
 for _ in {1..15}; do
@@ -422,13 +533,13 @@ for _ in {1..15}; do
 done
 
 if [ -d /tmp/web_src ]; then
-    mariadb -e "CREATE DATABASE IF NOT EXISTS webdb;"
-    mariadb -e "CREATE USER IF NOT EXISTS 'web'@'%' IDENTIFIED BY 'P@ssw0rd';"
-    mariadb -e "CREATE USER IF NOT EXISTS 'web'@'localhost' IDENTIFIED BY 'P@ssw0rd';"
-    mariadb -e "GRANT ALL PRIVILEGES ON webdb.* TO 'web'@'%';"
-    mariadb -e "GRANT ALL PRIVILEGES ON webdb.* TO 'web'@'localhost';"
-    mariadb -e "FLUSH PRIVILEGES;"
-    [ -f /tmp/web_src/dump.sql ] && mariadb webdb < /tmp/web_src/dump.sql
+    mariadb -e "CREATE DATABASE IF NOT EXISTS webdb;" 2>/dev/null || true
+    mariadb -e "CREATE USER IF NOT EXISTS 'web'@'%' IDENTIFIED BY 'P@ssw0rd';" 2>/dev/null || true
+    mariadb -e "CREATE USER IF NOT EXISTS 'web'@'localhost' IDENTIFIED BY 'P@ssw0rd';" 2>/dev/null || true
+    mariadb -e "GRANT ALL PRIVILEGES ON webdb.* TO 'web'@'%';" 2>/dev/null || true
+    mariadb -e "GRANT ALL PRIVILEGES ON webdb.* TO 'web'@'localhost';" 2>/dev/null || true
+    mariadb -e "FLUSH PRIVILEGES;" 2>/dev/null || true
+    [ -f /tmp/web_src/dump.sql ] && mariadb webdb < /tmp/web_src/dump.sql 2>/dev/null || true
 
     WEB_DIR="/var/www/html"
     [ -d /var/www/httpd2/htdocs ] && WEB_DIR="/var/www/httpd2/htdocs"
@@ -438,16 +549,15 @@ if [ -d /tmp/web_src ]; then
     [ -f "\$WEB_DIR/index.php" ] && sed -i 's/DB_USER_HERE/web/g; s/DB_PASS_HERE/P@ssw0rd/g; s/DB_NAME_HERE/webdb/g' "\$WEB_DIR/index.php"
     systemctl restart httpd2 >/dev/null 2>&1 || systemctl restart apache2 >/dev/null 2>&1 || true
 fi
-(systemctl is-active --quiet httpd2 || systemctl is-active --quiet apache2) && mariadb-admin ping >/dev/null 2>&1 && echo "WEB_OK=yes" || echo "WEB_OK=no"
 EOF
         local srv_out
-        srv_out="$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSH_PORT_HQ_SRV" "sshuser@$IP_HQ_SRV" \
-            "mountpoint -q '$RAID_MOUNT' && echo RAID_OK=yes || echo RAID_OK=no; exportfs | grep -q '$NFS_EXPORT_DIR' && echo NFS_OK=yes || echo NFS_OK=no; (systemctl is-active --quiet httpd2 || systemctl is-active --quiet apache2) && echo WEB_OK=yes || echo WEB_OK=no" 2>/dev/null || true)"
-        [[ "$srv_out" == *"RAID_OK=yes"* ]] && hqsrv_raid="yes"
+        srv_out="$(ssh_key_only "$SSH_PORT_HQ_SRV" "sshuser@$IP_HQ_SRV" \
+            "exportfs | grep -q '$NFS_EXPORT_DIR' && echo NFS_OK=yes || echo NFS_OK=no; (systemctl is-active --quiet httpd2 || systemctl is-active --quiet apache2) && echo WEB_OK=yes || echo WEB_OK=no" \
+            2>/dev/null || true)"
         [[ "$srv_out" == *"NFS_OK=yes"* ]] && hqsrv_nfs="yes"
         [[ "$srv_out" == *"WEB_OK=yes"* ]] && hqsrv_web="yes"
 
-        summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-SRV" "raid - $hqsrv_raid, nfs - $hqsrv_nfs, web - $hqsrv_web, chrony - $hqsrv_chrony, ping - $hqsrv_ping"
+        summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-SRV" "raid - $hqsrv_raid ($RAID_LEVEL/$RAID_FS), nfs - $hqsrv_nfs, web - $hqsrv_web, chrony - $hqsrv_chrony, ping - $hqsrv_ping"
 
         # 8. [Задания 1, 3, 9] BR-SRV -> HQ-CLI
         log "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-CLI"
@@ -455,11 +565,10 @@ EOF
         if ping -c 1 -W 2 "$IP_HQ_CLI" >/dev/null 2>&1; then cli_ping="yes"; fi
 
         if [ -f /var/lib/samba/private/krb5.conf ]; then
-            scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P 22 \
-                /var/lib/samba/private/krb5.conf "sshuser@$IP_HQ_CLI:/tmp/krb5.conf" >/dev/null 2>&1 || true
+            scp_key_only "22" /var/lib/samba/private/krb5.conf "sshuser@$IP_HQ_CLI:/tmp/krb5.conf" >/dev/null 2>&1 || true
         fi
 
-        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 22 "sshuser@$IP_HQ_CLI" "sudo bash -s" <<EOF >/dev/null 2>&1 || true
+        ssh_key_only "22" "sshuser@$IP_HQ_CLI" "sudo bash -s" <<EOF >/dev/null 2>&1 || true
 set -e
 systemctl stop avahi-daemon 2>/dev/null || true
 systemctl disable avahi-daemon 2>/dev/null || true
@@ -490,7 +599,7 @@ systemctl restart chronyd 2>/dev/null || systemctl restart chrony 2>/dev/null ||
 
 modprobe nfs 2>/dev/null || true
 modprobe nfsv3 2>/dev/null || true
-systemctl enable --now rpcbind >/dev/null 2>&1
+systemctl enable --now rpcbind >/dev/null 2>&1 || true
 systemctl enable --now nfs-client.target 2>/dev/null || systemctl enable --now nfs-client 2>/dev/null || true
 
 echo "$AD_ADMIN_PASS" | realm join -U Administrator --client-software=sssd "$AD_REALM" 2>/dev/null || true
@@ -520,8 +629,9 @@ done
 apt-get install -y yandex-browser-stable 2>/dev/null || true
 EOF
         local cli_out
-        cli_out="$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 22 "sshuser@$IP_HQ_CLI" \
-            "realm list 2>/dev/null | grep -qi 'hq.local' && echo AD_OK=yes || echo AD_OK=no; mountpoint -q '$CLI_NFS_MOUNT' && echo NFS_OK=yes || echo NFS_OK=no; (command -v yandex-browser-stable >/dev/null 2>&1 || rpm -q yandex-browser-stable >/dev/null 2>&1) && echo BR_OK=yes || echo BR_OK=no; (systemctl is-active --quiet chronyd || systemctl is-active --quiet chrony) && echo CH_OK=yes || echo CH_OK=no" 2>/dev/null || true)"
+        cli_out="$(ssh_key_only "22" "sshuser@$IP_HQ_CLI" \
+            "realm list 2>/dev/null | grep -qi 'hq.local' && echo AD_OK=yes || echo AD_OK=no; mountpoint -q '$CLI_NFS_MOUNT' && echo NFS_OK=yes || echo NFS_OK=no; (command -v yandex-browser-stable >/dev/null 2>&1 || rpm -q yandex-browser-stable >/dev/null 2>&1) && echo BR_OK=yes || echo BR_OK=no; (systemctl is-active --quiet chronyd || systemctl is-active --quiet chrony) && echo CH_OK=yes || echo CH_OK=no" \
+            2>/dev/null || true)"
         [[ "$cli_out" == *"AD_OK=yes"* ]] && cli_ad="yes"
         [[ "$cli_out" == *"NFS_OK=yes"* ]] && cli_nfs="yes"
         [[ "$cli_out" == *"BR_OK=yes"* ]] && cli_browser="yes"
@@ -565,7 +675,7 @@ EOF
         ansible targets -m ping && ans_ok="yes"
         summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> ANSIBLE" "inventory - yes, ping - $ans_ok"
 
-        # 10. Очистка истории и перезагрузка всех машин
+        # 10. Очистка истории и перезагрузка всех машин (сначала периферия, затем BR-SRV)
         log "Сохранение истории, очистка строки запуска и перезагрузка всех машин..."
 
         local remote_nodes=(
@@ -578,9 +688,9 @@ EOF
 
         for entry in "${remote_nodes[@]}"; do
             local u_h="${entry%:*}" p="${entry#*:}"
-            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -p "$p" "$u_h" \
+            ssh_key_only "$p" "$u_h" \
                 "history -a 2>/dev/null || true; history -w 2>/dev/null || true; sudo setsid sh -c 'sleep 2; /sbin/reboot -f || systemctl reboot -i' >/dev/null 2>&1 < /dev/null &" \
-                2>/dev/null || true
+                >/dev/null 2>&1 || true
             sleep 1
         done
 
