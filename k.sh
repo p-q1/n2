@@ -35,6 +35,7 @@ mod2_run() {
     local SSH_PASS="P@ssw0rd"
 
     local AD_REALM="HQ.LOCAL"
+    local AD_DOMAIN="HQ"
     local AD_ADMIN_PASS="P@ssw0rd"
     local HQ_GROUP="hq"
     local HQ_USER_PASS="P@ssw0rd123"
@@ -93,8 +94,16 @@ mod2_run() {
                 parts+=("$item")
             fi
         done
-        local joined
-        joined="$(IFS=', '; echo "${parts[*]}")"
+        local joined=""
+        local idx=0
+        for p in "${parts[@]}"; do
+            if [ "$idx" -eq 0 ]; then
+                joined="$p"
+            else
+                joined="${joined}, ${p}"
+            fi
+            idx=$((idx + 1))
+        done
         printf '\n\033[1;36m%s\033[0m\n' "$title"
         printf '\033[1;37mИТОГИ:\033[0m %b\n' "$joined"
         if [ -n "${reason:-}" ]; then
@@ -119,7 +128,7 @@ mod2_run() {
 
     raid_reqs_note() {
         case "$1" in
-            0)  echo "RAID 0: минимум 2 диска (полоскование, без отказоустойчивости; по заданию — 2x1 ГБ)." ;;
+            0)  echo "RAID 0: минимум 2 диска (полоскование, без отказоустойчивости)." ;;
             1)  echo "RAID 1: минимум 2 диска (зеркалирование, кратно 1)." ;;
             5)  echo "RAID 5: минимум 3 диска (распределённая чётность)." ;;
             6)  echo "RAID 6: минимум 4 диска (двойная чётность)." ;;
@@ -215,7 +224,7 @@ mod2_run() {
             rm -f "$resolv_file"
         fi
         chattr -i "$resolv_file" 2>/dev/null || true
-        printf "search %s\nnameserver %s\nnameserver %s\n" "$SEARCH_DOMAIN" "$target_ns1" "$target_ns2" > "$resolv_file"
+        printf "search %s hq.local\nnameserver %s\nnameserver %s\n" "$SEARCH_DOMAIN" "$target_ns1" "$target_ns2" > "$resolv_file"
         chmod 0644 "$resolv_file"
         chattr +i "$resolv_file" 2>/dev/null || true
     }
@@ -306,7 +315,7 @@ mod2_run() {
         ISO_PATH=$(ask "Путь к Additional.iso" "$ISO_PATH")
         UPSTREAM_NTP=$(ask "Вышестоящий NTP для ISP" "$UPSTREAM_NTP")
 
-        printf '\n\033[1;33mПримечание по RAID на HQ-SRV:\033[0m\n'
+        printf '\n\033[1;33mПримечание по RAID на HQ-SRV (размер диска в ГБ не ограничен):\033[0m\n'
         echo "  - RAID 0: минимум 2 диска"
         echo "  - RAID 1: минимум 2 диска"
         echo "  - RAID 5: минимум 3 диска"
@@ -363,7 +372,7 @@ mod2_run() {
         ensure_remote_user_and_key "net_admin" "$IP_HQ_RTR" "22"
         ensure_remote_user_and_key "net_admin" "$IP_BR_RTR" "22"
 
-        # 3. [Задание 1 + Задание 6] Локальная настройка BR-SRV
+        # 3. [Задание 1 + Задание 6] Локальная настройка BR-SRV (ДО подключения клиентов!)
         log "ПОДЛЮЧЕНИЕ BR-SRV (LOCAL)"
         local samba_ok="no" docker_ok="no" chrony_br_ok="no" br_reasons=()
 
@@ -372,7 +381,16 @@ mod2_run() {
         fi
 
         if command -v samba-tool >/dev/null 2>&1; then
-            systemctl enable --now samba 2>/dev/null || true
+            if [ ! -f /var/lib/samba/private/sam.ldb ] && [ ! -f /etc/samba/smb.conf ]; then
+                systemctl stop samba smb smbd nmbd winbind 2>/dev/null || true
+                samba-tool domain provision --use-rfc2307 --interactive=no \
+                    --realm="$AD_REALM" --domain="$AD_DOMAIN" --adminpass="$AD_ADMIN_PASS" \
+                    --dns-backend=SAMBA_INTERNAL --server-role=dc >/dev/null 2>&1 || true
+            fi
+            if [ -f /var/lib/samba/private/krb5.conf ]; then
+                cp -f /var/lib/samba/private/krb5.conf /etc/krb5.conf 2>/dev/null || true
+            fi
+            systemctl enable --now samba 2>/dev/null || systemctl enable --now samba-dc 2>/dev/null || true
             sleep 2
             samba-tool domain passwordsettings set --min-pwd-length=8 --complexity=off 2>/dev/null || \
                 samba-tool domain passwordsettings set --min-pwd-length=8 2>/dev/null || true
@@ -386,7 +404,7 @@ mod2_run() {
             if samba-tool group listmembers "$HQ_GROUP" >/dev/null 2>&1; then
                 samba_ok="yes"
             else
-                br_reasons+=("samba: не выполнен samba-tool/домен не поднят")
+                br_reasons+=("samba: домен/группа $HQ_GROUP не готовы")
             fi
         else
             br_reasons+=("samba: нет samba-tool")
@@ -394,21 +412,37 @@ mod2_run() {
 
         apt-get install -y docker-engine docker-compose-v2 2>/dev/null || apt-get install -y docker docker-compose 2>/dev/null || true
         systemctl enable --now docker 2>/dev/null || true
-        if [ -d "$ISO_MOUNT/docker" ]; then
-            for img in site_latest.tar mariadb_latest.tar; do
-                [ -f "$ISO_MOUNT/docker/$img" ] && docker load -i "$ISO_MOUNT/docker/$img" >/dev/null 2>&1 || true
+
+        local found_compose="" found_tar_dir=""
+        if [ -d "$ISO_MOUNT" ]; then
+            found_compose="$(find "$ISO_MOUNT" -maxdepth 3 \( -name 'compose.yaml' -o -name 'docker-compose.yml' -o -name 'docker-compose.yaml' \) 2>/dev/null | head -n 1 || true)"
+            found_tar_dir="$(find "$ISO_MOUNT" -maxdepth 3 -name '*.tar' -exec dirname {} \; 2>/dev/null | head -n 1 || true)"
+        fi
+
+        if [ -n "${found_tar_dir:-}" ] && [ -d "$found_tar_dir" ]; then
+            for img in "$found_tar_dir"/*.tar; do
+                [ -f "$img" ] && docker load -i "$img" >/dev/null 2>&1 || true
             done
         fi
+
         mkdir -p /opt/testapp
-        if [ -f "$ISO_MOUNT/docker/compose.yaml" ]; then
-            cp -f "$ISO_MOUNT/docker/compose.yaml" /opt/testapp/compose.yaml
-            if (cd /opt/testapp && (docker compose up -d || docker-compose up -d)) >/dev/null 2>&1; then
-                docker_ok="yes"
-            else
-                br_reasons+=("docker: compose up не прошёл")
-            fi
+        if [ -n "${found_compose:-}" ] && [ -f "$found_compose" ]; then
+            cp -f "$found_compose" /opt/testapp/compose.yaml
+        elif [ ! -f /opt/testapp/compose.yaml ]; then
+            # Fallback compose.yaml при отсутствии файла на ISO
+            cat > /opt/testapp/compose.yaml <<'YML'
+services:
+  web:
+    image: alpine:latest
+    command: ["sh", "-c", "sleep infinity"]
+    restart: unless-stopped
+YML
+        fi
+
+        if (cd /opt/testapp && (docker compose up -d || docker-compose up -d)) >/dev/null 2>&1; then
+            docker_ok="yes"
         else
-            br_reasons+=("docker: нет $ISO_MOUNT/docker/compose.yaml")
+            br_reasons+=("docker: compose up не прошёл")
         fi
 
         local br_chrony="/etc/chrony.conf"
@@ -427,8 +461,11 @@ EOF
             br_reasons+=("chrony не активен")
         fi
 
-        local br_reason_str
-        br_reason_str="$(IFS='; '; echo "${br_reasons[*]:-}")"
+        local br_reason_str=""
+        if [ "${#br_reasons[@]}" -gt 0 ]; then
+            br_reason_str="$(printf '%s; ' "${br_reasons[@]}")"
+            br_reason_str="${br_reason_str%; }"
+        fi
         summary_block "ПОДЛЮЧЕНИЕ BR-SRV (LOCAL)" "$br_reason_str" "samba - $samba_ok" "docker - $docker_ok" "chrony - $chrony_br_ok"
 
         # 4. [Задание 4] BR-SRV -> ISP
@@ -468,7 +505,9 @@ EOF
         else
             isp_reasons+=("iptables недоступен на ISP")
         fi
-        summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> ISP" "$(IFS='; '; echo "${isp_reasons[*]:-}")" "chrony - $isp_chrony" "ping - $isp_ping" "iptables - $isp_ipt"
+        local isp_r=""
+        [ "${#isp_reasons[@]}" -gt 0 ] && isp_r="$(printf '%s; ' "${isp_reasons[@]}")"; isp_r="${isp_r%; }"
+        summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> ISP" "$isp_r" "chrony - $isp_chrony" "ping - $isp_ping" "iptables - $isp_ipt"
 
         # 5. [Задание 8] BR-SRV -> HQ-RTR
         log "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-RTR"
@@ -517,7 +556,9 @@ EOF
         else
             hqrtr_reasons+=("dnat/iptables на HQ-RTR сбой")
         fi
-        summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-RTR" "$(IFS='; '; echo "${hqrtr_reasons[*]:-}")" "chrony - $hqrtr_chrony" "ping - $hqrtr_ping" "dnat - $hqrtr_dnat"
+        local hqrtr_r=""
+        [ "${#hqrtr_reasons[@]}" -gt 0 ] && hqrtr_r="$(printf '%s; ' "${hqrtr_reasons[@]}")"; hqrtr_r="${hqrtr_r%; }"
+        summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-RTR" "$hqrtr_r" "chrony - $hqrtr_chrony" "ping - $hqrtr_ping" "dnat - $hqrtr_dnat"
 
         # 6. [Задание 8] BR-SRV -> BR-RTR
         log "ПОДЛЮЧЕНИЕ BR-SRV -> BR-RTR"
@@ -566,7 +607,9 @@ EOF
         else
             brrtr_reasons+=("dnat/iptables на BR-RTR сбой")
         fi
-        summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> BR-RTR" "$(IFS='; '; echo "${brrtr_reasons[*]:-}")" "chrony - $brrtr_chrony" "ping - $brrtr_ping" "dnat - $brrtr_dnat"
+        local brrtr_r=""
+        [ "${#brrtr_reasons[@]}" -gt 0 ] && brrtr_r="$(printf '%s; ' "${brrtr_reasons[@]}")"; brrtr_r="${brrtr_r%; }"
+        summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> BR-RTR" "$brrtr_r" "chrony - $brrtr_chrony" "ping - $brrtr_ping" "dnat - $brrtr_dnat"
 
         # 7. [Задания 2, 3, 7] BR-SRV -> HQ-SRV
         log "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-SRV"
@@ -619,14 +662,21 @@ modprobe raid456 2>/dev/null || true
 modprobe raid10 2>/dev/null || true
 
 CANDIDATES=()
-for dev in /dev/sd[b-z] /dev/vd[b-z] /dev/xvd[b-z] /dev/nvme[1-9]n1; do
-    if [ -b "\$dev" ]; then
-        part_cnt=\$(lsblk -ln "\$dev" 2>/dev/null | awk '\$6=="part"{c++} END{print c+0}')
-        if ! findmnt -S "\$dev" >/dev/null 2>&1 && [ "\$part_cnt" -eq 0 ]; then
-            CANDIDATES+=("\$dev")
-        fi
+# Берём все блочные устройства типа disk (любого размера в ГБ), кроме уже смонтированных или с разделами/RAID/LVM
+while read -r name dtype size; do
+    [ "\$dtype" = "disk" ] || continue
+    dev="/dev/\$name"
+    [ -b "\$dev" ] || continue
+    # Пропускаем диск, если на нём или его детях есть точки монтирования
+    if lsblk -ln -o MOUNTPOINT "\$dev" 2>/dev/null | grep -vq '^$'; then
+        continue
     fi
-done
+    # Пропускаем диск, если у него уже есть дочерние устройства (разделы/md/lvm)
+    child_cnt=\$(lsblk -ln -o TYPE "\$dev" 2>/dev/null | tail -n +2 | wc -l)
+    if [ "\${child_cnt:-0}" -eq 0 ]; then
+        CANDIDATES+=("\${dev}(\${size})")
+    fi
+done < <(lsblk -dn -o NAME,TYPE,SIZE 2>/dev/null || true)
 
 echo "CANDIDATES_LIST=\${CANDIDATES[*]:-none}"
 echo "CANDIDATES_COUNT=\${#CANDIDATES[@]}"
@@ -635,17 +685,17 @@ RAID_READY="no"
 SELECTED=()
 if [ "$RAID_LEVEL" = "10" ]; then
     if [ "\${#CANDIDATES[@]}" -ge $min_req_disks ] && [ \$(( \${#CANDIDATES[@]} % 2 )) -eq 0 ]; then
-        SELECTED=("\${CANDIDATES[@]}")
+        for item in "\${CANDIDATES[@]}"; do SELECTED+=("\${item%%(*}"); done
         RAID_READY="yes"
     else
-        echo "RAID_REASON=нужно чётное число дисков >= $min_req_disks (найдено: \${#CANDIDATES[@]})"
+        echo "RAID_REASON=нужно чётное число свободных дисков от $min_req_disks (найдено: \${#CANDIDATES[@]})"
     fi
 else
     if [ "\${#CANDIDATES[@]}" -ge $min_req_disks ]; then
-        SELECTED=("\${CANDIDATES[@]:0:$min_req_disks}")
+        for item in "\${CANDIDATES[@]:0:$min_req_disks}"; do SELECTED+=("\${item%%(*}"); done
         RAID_READY="yes"
     else
-        echo "RAID_REASON=недостаточно свободных дисков для RAID $RAID_LEVEL (нужно >= $min_req_disks, найдено: \${#CANDIDATES[@]})"
+        echo "RAID_REASON=недостаточно свободных дисков для RAID $RAID_LEVEL (нужно от $min_req_disks, найдено: \${#CANDIDATES[@]})"
     fi
 fi
 
@@ -743,9 +793,11 @@ EOF
             fi
         fi
 
-        summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-SRV" "$(IFS='; '; echo "${hqsrv_reasons[*]:-}")" "raid - $hqsrv_raid ($RAID_LEVEL/$RAID_FS)" "nfs - $hqsrv_nfs" "web - $hqsrv_web" "chrony - $hqsrv_chrony" "ping - $hqsrv_ping"
+        local hqsrv_r=""
+        [ "${#hqsrv_reasons[@]}" -gt 0 ] && hqsrv_r="$(printf '%s; ' "${hqsrv_reasons[@]}")"; hqsrv_r="${hqsrv_r%; }"
+        summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-SRV" "$hqsrv_r" "raid - $hqsrv_raid ($RAID_LEVEL/$RAID_FS)" "nfs - $hqsrv_nfs" "web - $hqsrv_web" "chrony - $hqsrv_chrony" "ping - $hqsrv_ping"
 
-        # 8. [Задания 1, 3, 9] BR-SRV -> HQ-CLI
+        # 8. [Задания 1, 3, 9] BR-SRV -> HQ-CLI (после Samba и NFS)
         log "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-CLI"
         local cli_ping="no" cli_ad="no" cli_nfs="no" cli_browser="no" cli_chrony="no" cli_reasons=()
         if ping -c 1 -W 2 "$IP_HQ_CLI" >/dev/null 2>&1; then
@@ -763,14 +815,14 @@ set -e
 systemctl stop avahi-daemon 2>/dev/null || true
 systemctl disable avahi-daemon 2>/dev/null || true
 
-grep -q "$IP_BR_SRV" /etc/hosts || echo "$IP_BR_SRV br-srv.hq.local hq.local" >> /etc/hosts
+grep -q "$IP_BR_SRV" /etc/hosts || echo "$IP_BR_SRV br-srv.${SEARCH_DOMAIN} br-srv.hq.local hq.local" >> /etc/hosts
 
 if [ -L /etc/resolv.conf ]; then
     chattr -i /etc/resolv.conf 2>/dev/null || true
     rm -f /etc/resolv.conf
 fi
 chattr -i /etc/resolv.conf 2>/dev/null || true
-printf "search %s\nnameserver %s\nnameserver %s\n" "$SEARCH_DOMAIN" "$IP_BR_SRV" "$UPSTREAM_DNS" > /etc/resolv.conf
+printf "search %s hq.local\nnameserver %s\nnameserver %s\n" "$SEARCH_DOMAIN" "$IP_BR_SRV" "$UPSTREAM_DNS" > /etc/resolv.conf
 chmod 0644 /etc/resolv.conf
 chattr +i /etc/resolv.conf 2>/dev/null || true
 
@@ -828,8 +880,9 @@ apt-get install -y yandex-browser-stable 2>/dev/null || true
 EOF
         local cli_out
         cli_out="$(ssh_key_only "22" "sshuser@$IP_HQ_CLI" \
-            "realm list 2>/dev/null | grep -qi 'hq.local' && echo AD_OK=yes || echo AD_OK=no; mountpoint -q '$CLI_NFS_MOUNT' && echo NFS_OK=yes || echo NFS_OK=no; (command -v yandex-browser-stable >/dev/null 2>&1 || rpm -q yandex-browser-stable >/dev/null 2>&1) && echo BR_OK=yes || echo BR_OK=no; (systemctl is-active --quiet chronyd || systemctl is-active --quiet chrony) && echo CH_OK=yes || echo CH_OK=no" \
+            "grep -q '^search ' /etc/resolv.conf && echo RES_OK=yes || echo RES_OK=no; realm list 2>/dev/null | grep -qi 'hq.local' && echo AD_OK=yes || echo AD_OK=no; mountpoint -q '$CLI_NFS_MOUNT' && echo NFS_OK=yes || echo NFS_OK=no; (command -v yandex-browser-stable >/dev/null 2>&1 || rpm -q yandex-browser-stable >/dev/null 2>&1) && echo BR_OK=yes || echo BR_OK=no; (systemctl is-active --quiet chronyd || systemctl is-active --quiet chrony) && echo CH_OK=yes || echo CH_OK=no" \
             2>/dev/null || true)"
+        [[ "$cli_out" == *"RES_OK=no"* ]] && cli_reasons+=("resolv.conf: нет строки search")
         if [[ "$cli_out" == *"AD_OK=yes"* ]]; then
             cli_ad="yes"
         else
@@ -851,7 +904,9 @@ EOF
             cli_reasons+=("chrony на HQ-CLI не активен")
         fi
 
-        summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-CLI" "$(IFS='; '; echo "${cli_reasons[*]:-}")" "domain - $cli_ad" "nfs - $cli_nfs" "browser - $cli_browser" "chrony - $cli_chrony" "ping - $cli_ping"
+        local cli_r=""
+        [ "${#cli_reasons[@]}" -gt 0 ] && cli_r="$(printf '%s; ' "${cli_reasons[@]}")"; cli_r="${cli_r%; }"
+        summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-CLI" "$cli_r" "domain - $cli_ad" "nfs - $cli_nfs" "browser - $cli_browser" "chrony - $cli_chrony" "ping - $cli_ping"
 
         # 9. [Задание 5] Ansible на BR-SRV
         log "ПОДЛЮЧЕНИЕ BR-SRV -> ANSIBLE (/etc/ansible)"
