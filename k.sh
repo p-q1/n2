@@ -12,7 +12,7 @@ mod2_run() {
     trap 'set +u' RETURN
 
     export DEBIAN_FRONTEND=noninteractive
-    local APT_OPTS="-o DPkg::Lock::Timeout=5 -o Acquire::Retries=1"
+    local APT_OPTS="-o DPkg::Lock::Timeout=3 -o Acquire::Retries=1"
 
     if [ "$EUID" -ne 0 ]; then
         echo "Ошибка: требуются права root (выполните sudo -i)."
@@ -137,22 +137,6 @@ mod2_run() {
         else
             echo "$default_val"
         fi
-    }
-
-    retry_cmd() {
-        local attempts="$1" delay="$2"
-        shift 2
-        local n=1
-        while [ "$n" -le "$attempts" ]; do
-            if "$@"; then
-                return 0
-            fi
-            if [ "$n" -lt "$attempts" ]; then
-                sleep "$delay"
-            fi
-            n=$((n + 1))
-        done
-        return 1
     }
 
     raid_min_disks() {
@@ -330,10 +314,10 @@ mod2_run() {
             SSH_PASS=$(ask_secret "Новый пароль для $ssh_user" "$SSH_PASS")
         fi
 
-        apt-get $APT_OPTS update -y >/dev/null 2>&1 || warn "Ошибка apt-get update на $hn"
+        apt-get $APT_OPTS update -y >/dev/null 2>&1 || true
 
         local base_pkgs="openssh-server openssh-clients sshpass python3 sudo nano curl wget ca-certificates chrony iptables iproute2 util-linux e2fsprogs"
-        apt-get $APT_OPTS install -y $base_pkgs >/dev/null 2>&1 || warn "Часть базовых пакетов не установилась на $hn"
+        apt-get $APT_OPTS install -y $base_pkgs >/dev/null 2>&1 || true
 
         modprobe nfs nfsv3 raid0 raid1 raid456 raid10 2>/dev/null || true
 
@@ -379,12 +363,12 @@ mod2_run() {
 
     configure_samba_dc() {
         local reason_out_var="$1"
-        local err=""
+        local err="" prov_log=""
         local br_fqdn="br-srv.${SEARCH_DOMAIN}"
 
         hostnamectl set-hostname "$br_fqdn" 2>/dev/null || hostname "$br_fqdn" 2>/dev/null || true
-        grep -qE "[[:space:]]${br_fqdn}([[:space:]]|$)" /etc/hosts || \
-            printf "%s %s br-srv\n" "$IP_BR_SRV" "$br_fqdn" >> /etc/hosts
+        sed -i "/[[:space:]]${br_fqdn}\b/d" /etc/hosts 2>/dev/null || true
+        printf "127.0.0.1 localhost.localdomain localhost\n%s %s br-srv\n" "$IP_BR_SRV" "$br_fqdn" > /etc/hosts
 
         apply_resolv_conf "$IP_HQ_SRV" "$UPSTREAM_DNS"
 
@@ -405,16 +389,13 @@ mod2_run() {
             rm -rf /var/lib/samba /var/cache/samba 2>/dev/null || true
             mkdir -p /var/lib/samba/sysvol
 
-            if ! samba-tool domain provision --use-rfc2307 --interactive=no \
+            prov_log="$(samba-tool domain provision --use-rfc2307 --interactive=no \
                 --realm="$AD_REALM" --domain="$AD_DOMAIN" --adminpass="$AD_ADMIN_PASS" \
-                --host-ip="$IP_BR_SRV" --dns-backend=SAMBA_INTERNAL --dns-forwarder="$IP_HQ_SRV" --server-role=dc >/dev/null 2>&1; then
-                if ! samba-tool domain provision --use-rfc2307 --interactive=no \
-                    --realm="$AD_REALM" --domain="$AD_DOMAIN" --adminpass="$AD_ADMIN_PASS" \
-                    --dns-backend=SAMBA_INTERNAL --dns-forwarder="$IP_HQ_SRV" --server-role=dc >/dev/null 2>&1; then
-                    printf -v "$reason_out_var" "samba: domain provision не прошёл"
-                    return 1
-                fi
-            fi
+                --dns-backend=SAMBA_INTERNAL --dns-forwarder="$IP_HQ_SRV" --server-role=dc 2>&1)" || {
+                err="$(printf '%s\n' "$prov_log" | tail -n 1)"
+                printf -v "$reason_out_var" "samba: provision (${err:-ошибка samba-tool})"
+                return 1
+            }
         fi
 
         if [ -f /var/lib/samba/private/krb5.conf ]; then
@@ -425,10 +406,6 @@ mod2_run() {
 
         systemctl enable --now samba 2>/dev/null || systemctl enable --now samba-dc 2>/dev/null || true
         systemctl restart samba 2>/dev/null || systemctl restart samba-dc 2>/dev/null || true
-        if ! retry_cmd 2 1 bash -c 'systemctl is-active --quiet samba || systemctl is-active --quiet samba-dc || samba-tool dbcheck --cross-ncs >/dev/null 2>&1'; then
-            printf -v "$reason_out_var" "samba: служба AD DC не запустилась"
-            return 1
-        fi
 
         samba-tool domain passwordsettings set \
             --min-pwd-length=8 --complexity=off \
@@ -442,12 +419,12 @@ mod2_run() {
             samba-tool group addmembers "$HQ_GROUP" "hquser${i}" >/dev/null 2>&1 || true
         done
 
-        if retry_cmd 2 1 samba-tool group listmembers "$HQ_GROUP" >/dev/null 2>&1; then
+        if samba-tool group listmembers "$HQ_GROUP" >/dev/null 2>&1; then
             return 0
         fi
 
-        err="$(samba-tool dbcheck 2>&1 | tail -n 1 || true)"
-        printf -v "$reason_out_var" "samba: группа $HQ_GROUP недоступна (${err:-проверь samba-tool})"
+        err="$(samba-tool group listmembers "$HQ_GROUP" 2>&1 | tail -n 1 || true)"
+        printf -v "$reason_out_var" "samba: группа $HQ_GROUP (${err:-проверь службу samba})"
         return 1
     }
 
@@ -543,15 +520,11 @@ mod2_run() {
         pub_key="$(cat /root/.ssh/id_ed25519.pub)"
         ans_pub="$(cat /root/.ssh/ansible.pub)"
 
-        sync_all_keys() {
-            ensure_remote_user_and_key "$USER_ISP" "$IP_ISP_EXT" "$SSH_PORT_ISP" "$pub_key" "$ans_pub" || true
-            ensure_remote_user_and_key "$USER_HQ_SRV" "$IP_HQ_SRV" "$SSH_PORT_HQ_SRV" "$pub_key" "$ans_pub" || true
-            ensure_remote_user_and_key "$USER_HQ_CLI" "$IP_HQ_CLI" "$SSH_PORT_HQ_CLI" "$pub_key" "$ans_pub" || true
-            ensure_remote_user_and_key "$USER_HQ_RTR" "$IP_HQ_RTR" "$SSH_PORT_HQ_RTR" "$pub_key" "$ans_pub" || true
-            ensure_remote_user_and_key "$USER_BR_RTR" "$IP_BR_RTR" "$SSH_PORT_BR_RTR" "$pub_key" "$ans_pub" || true
-        }
-
-        sync_all_keys
+        ensure_remote_user_and_key "$USER_ISP" "$IP_ISP_EXT" "$SSH_PORT_ISP" "$pub_key" "$ans_pub" || true
+        ensure_remote_user_and_key "$USER_HQ_SRV" "$IP_HQ_SRV" "$SSH_PORT_HQ_SRV" "$pub_key" "$ans_pub" || true
+        ensure_remote_user_and_key "$USER_HQ_CLI" "$IP_HQ_CLI" "$SSH_PORT_HQ_CLI" "$pub_key" "$ans_pub" || true
+        ensure_remote_user_and_key "$USER_HQ_RTR" "$IP_HQ_RTR" "$SSH_PORT_HQ_RTR" "$pub_key" "$ans_pub" || true
+        ensure_remote_user_and_key "$USER_BR_RTR" "$IP_BR_RTR" "$SSH_PORT_BR_RTR" "$pub_key" "$ans_pub" || true
 
         # 3. [Задание 1 + Задание 6] Локальная настройка BR-SRV
         log "ПОДЛЮЧЕНИЕ BR-SRV (LOCAL)"
@@ -590,20 +563,16 @@ mod2_run() {
             if [ -d "$(dirname "$found_compose")/docker" ]; then
                 cp -a "$(dirname "$found_compose")/docker/." /root/testapp/ 2>/dev/null || true
             fi
-        elif [ ! -f /root/testapp/compose.yaml ]; then
-            cat > /root/testapp/compose.yaml <<'YML'
-services:
-  web:
-    image: alpine:latest
-    command: ["sh", "-c", "sleep infinity"]
-    restart: unless-stopped
-YML
         fi
 
-        if (cd /root/testapp && (docker compose -p testapp up -d || docker compose up -d || docker-compose up -d)) >/dev/null 2>&1; then
+        local comp_out=""
+        comp_out="$(cd /root/testapp && (docker compose -p testapp up -d --remove-orphans 2>&1 || docker compose up -d 2>&1 || docker-compose up -d 2>&1))"
+        if [ $? -eq 0 ]; then
             docker_ok="yes"
         else
-            br_reasons+=("docker: compose up не прошёл")
+            local c_err
+            c_err="$(printf '%s\n' "$comp_out" | tail -n 1)"
+            br_reasons+=("docker: ${c_err:-compose up не прошёл}")
         fi
 
         local br_chrony="/etc/chrony.conf"
@@ -822,18 +791,28 @@ esac
 
 modprobe raid0 raid1 raid456 raid10 2>/dev/null || true
 
+SYS_DISKS=()
+for mp in "/" "/boot" "/boot/efi" "[SWAP]"; do
+    src=\$(lsblk -ln -o PKNAME,MOUNTPOINT 2>/dev/null | awk -v m="\$mp" '\$2==m {print \$1}' | head -n 1)
+    [ -n "\$src" ] && SYS_DISKS+=("/dev/\$src")
+    src2=\$(lsblk -ln -o NAME,MOUNTPOINT 2>/dev/null | awk -v m="\$mp" '\$2==m {print \$1}' | head -n 1)
+    [ -n "\$src2" ] && SYS_DISKS+=("/dev/\$src2")
+done
+
 CANDIDATES=()
 while read -r name dtype size; do
     [ "\$dtype" = "disk" ] || continue
     dev="/dev/\$name"
     [ -b "\$dev" ] || continue
-    if lsblk -ln -o MOUNTPOINT "\$dev" 2>/dev/null | grep -vq '^$'; then
-        continue
-    fi
-    child_cnt=\$(lsblk -ln -o TYPE "\$dev" 2>/dev/null | tail -n +2 | wc -l)
-    if [ "\${child_cnt:-0}" -eq 0 ]; then
-        CANDIDATES+=("\${dev}(\${size})")
-    fi
+    skip="no"
+    for sd in "\${SYS_DISKS[@]:-}"; do
+        if [ -n "\$sd" ] && [[ "\$dev" == "\$sd"* || "\$sd" == "\$dev"* ]]; then
+            skip="yes"
+            break
+        fi
+    done
+    [ "\$skip" = "yes" ] && continue
+    CANDIDATES+=("\${dev}(\${size})")
 done < <(lsblk -dn -o NAME,TYPE,SIZE 2>/dev/null || true)
 
 echo "CANDIDATES_LIST=\${CANDIDATES[*]:-none}"
@@ -846,37 +825,36 @@ if [ "$RAID_LEVEL" = "10" ]; then
         for item in "\${CANDIDATES[@]}"; do SELECTED+=("\${item%%(*}"); done
         RAID_READY="yes"
     else
-        echo "RAID_REASON=нужно чётное число свободных дисков от $min_req_disks (найдено: \${#CANDIDATES[@]})"
+        echo "RAID_REASON=нужно чётное число дисков от $min_req_disks (найдено: \${#CANDIDATES[@]})"
     fi
 else
     if [ "\${#CANDIDATES[@]}" -ge $min_req_disks ]; then
         for item in "\${CANDIDATES[@]:0:$min_req_disks}"; do SELECTED+=("\${item%%(*}"); done
         RAID_READY="yes"
     else
-        echo "RAID_REASON=недостаточно свободных дисков для RAID $RAID_LEVEL (нужно от $min_req_disks, найдено: \${#CANDIDATES[@]})"
+        echo "RAID_REASON=недостаточно дисков для RAID $RAID_LEVEL (нужно от $min_req_disks, найдено: \${#CANDIDATES[@]})"
     fi
 fi
 
 if [ "\$RAID_READY" = "yes" ]; then
     echo "SELECTED_DISKS=\${SELECTED[*]}"
-    if [ ! -b "$RAID_DEV" ]; then
-        mdadm --zero-superblock --force "\${SELECTED[@]}" >/dev/null 2>&1 || true
-        wipefs --all --force "\${SELECTED[@]}" >/dev/null 2>&1 || true
-        mdadm --create "$RAID_DEV" --level=$RAID_LEVEL --raid-devices=\${#SELECTED[@]} "\${SELECTED[@]}" --run --yes >/dev/null 2>&1 || true
-    fi
+    umount "$RAID_MOUNT" 2>/dev/null || true
+    mdadm --stop "$RAID_DEV" 2>/dev/null || true
+    mdadm --zero-superblock --force "\${SELECTED[@]}" >/dev/null 2>&1 || true
+    wipefs --all --force "\${SELECTED[@]}" >/dev/null 2>&1 || true
+    mdadm --create "$RAID_DEV" --level=$RAID_LEVEL --raid-devices=\${#SELECTED[@]} "\${SELECTED[@]}" --run --yes >/dev/null 2>&1 || true
     if [ -b "$RAID_DEV" ]; then
         mkdir -p /etc/mdadm
         echo "DEVICE partitions" > /etc/mdadm/mdadm.conf
         mdadm --detail --scan 2>/dev/null | awk '/ARRAY/ {print}' >> /etc/mdadm/mdadm.conf || true
-        if ! blkid "$RAID_DEV" >/dev/null 2>&1; then
-            case "$RAID_FS" in
-                xfs)   mkfs.xfs -f "$RAID_DEV" >/dev/null 2>&1 || true ;;
-                btrfs) mkfs.btrfs -f "$RAID_DEV" >/dev/null 2>&1 || true ;;
-                *)     mkfs.ext4 -F "$RAID_DEV" >/dev/null 2>&1 || true ;;
-            esac
-        fi
+        case "$RAID_FS" in
+            xfs)   mkfs.xfs -f "$RAID_DEV" >/dev/null 2>&1 || true ;;
+            btrfs) mkfs.btrfs -f "$RAID_DEV" >/dev/null 2>&1 || true ;;
+            *)     mkfs.ext4 -F "$RAID_DEV" >/dev/null 2>&1 || true ;;
+        esac
         mkdir -p "$RAID_MOUNT"
-        grep -q "^$RAID_DEV[[:space:]]" /etc/fstab || echo "$RAID_DEV $RAID_MOUNT $RAID_FS defaults 0 0" >> /etc/fstab
+        sed -i "\|^$RAID_DEV[[:space:]]|d" /etc/fstab 2>/dev/null || true
+        echo "$RAID_DEV $RAID_MOUNT $RAID_FS defaults 0 0" >> /etc/fstab
         mount -a || true
     fi
 fi
@@ -915,7 +893,7 @@ apt-get $APT_OPTS install -y apache2 apache2-mod_php8.3 php8.3-mysqlnd-mysqli ma
 systemctl enable --now mariadb >/dev/null 2>&1 || true
 systemctl enable --now httpd2 >/dev/null 2>&1 || systemctl enable --now apache2 >/dev/null 2>&1 || true
 
-for _ in {1..5}; do
+for _ in {1..3}; do
     mariadb-admin ping >/dev/null 2>&1 && break
     sleep 1
 done
@@ -1065,7 +1043,7 @@ host_key_checking = False
 interpreter_python = /usr/bin/python3
 deprecation_warnings = False
 command_warnings = False
-timeout = 5
+timeout = 4
 EOF
         cat > /etc/ansible/hosts <<EOF
 [servers]
