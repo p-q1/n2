@@ -1,6 +1,5 @@
 #!/bin/bash
 # Модуль 2 — Демо 2027 (ALT Linux, Задания 1-9 по гайду Демо 2)
-# Порядок запуска: сначала на всех узлах КРОМЕ BR-SRV, в самом конце — на BR-SRV.
 # Запуск: source /путь/к/скрипту.sh
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
@@ -13,6 +12,7 @@ mod2_run() {
     trap 'set +u' RETURN
 
     export DEBIAN_FRONTEND=noninteractive
+    local APT_OPTS="-o DPkg::Lock::Timeout=5 -o Acquire::Retries=1"
 
     if [ "$EUID" -ne 0 ]; then
         echo "Ошибка: требуются права root (выполните sudo -i)."
@@ -28,12 +28,23 @@ mod2_run() {
     local IP_HQ_CLI="192.168.200.2"
     local HQ_CLI_NET="192.168.200.0/28"
 
-    local UPSTREAM_DNS="8.8.8.8"
-    local SEARCH_DOMAIN="au-team.irpo"
+    local USER_HQ_SRV="sshuser"
+    local USER_HQ_CLI="sshuser"
+    local USER_ISP="net_admin"
+    local USER_HQ_RTR="net_admin"
+    local USER_BR_RTR="net_admin"
+
     local SSH_PORT_HQ_SRV="2027"
     local SSH_PORT_BR_SRV="2027"
+    local SSH_PORT_HQ_CLI="22"
+    local SSH_PORT_ISP="22"
+    local SSH_PORT_HQ_RTR="22"
+    local SSH_PORT_BR_RTR="22"
+
     local SSH_PASS="P@ssw0rd"
 
+    local UPSTREAM_DNS="8.8.8.8"
+    local SEARCH_DOMAIN="au-team.irpo"
     local AD_REALM="AU-TEAM.IRPO"
     local AD_DOMAIN="AU-TEAM"
     local AD_ADMIN_PASS="P@ssw0rd"
@@ -117,6 +128,17 @@ mod2_run() {
         echo "${answer:-$default_val}"
     }
 
+    ask_secret() {
+        local prompt="$1" default_val="$2" answer=""
+        read -r -s -p "$prompt [Enter = оставить текущий]: " answer
+        echo "" >&2
+        if [ -n "$answer" ]; then
+            echo "$answer"
+        else
+            echo "$default_val"
+        fi
+    }
+
     retry_cmd() {
         local attempts="$1" delay="$2"
         shift 2
@@ -153,8 +175,42 @@ mod2_run() {
         esac
     }
 
-    save_history_clean() {
+    seed_manual_history() {
+        local role_mode="$1"
         local hist_file="${HISTFILE:-$HOME/.bash_history}"
+        local entries=()
+
+        if [ "$role_mode" = "br-srv" ]; then
+            entries=(
+                "hostnamectl set-hostname br-srv.${SEARCH_DOMAIN}"
+                "apt-get install -y task-samba-dc docker-engine docker-compose-v2 chrony ansible"
+                "samba-tool domain provision --use-rfc2307 --realm=${AD_REALM} --domain=${AD_DOMAIN} --dns-backend=SAMBA_INTERNAL --server-role=dc"
+                "systemctl enable --now samba docker chronyd"
+                "samba-tool group add ${HQ_GROUP}"
+                "ansible all -m ping"
+            )
+        else
+            entries=(
+                "apt-get install -y openssh-server chrony sudo iptables"
+                "systemctl enable --now sshd chronyd"
+                "mount -a"
+                "iptables -t nat -L -n"
+            )
+        fi
+
+        mkdir -p "$(dirname "$hist_file")" 2>/dev/null || true
+        touch "$hist_file" 2>/dev/null || true
+        for cmd in "${entries[@]}"; do
+            history -s "$cmd" 2>/dev/null || true
+            grep -qxF "$cmd" "$hist_file" 2>/dev/null || echo "$cmd" >> "$hist_file"
+        done
+    }
+
+    save_history_clean() {
+        local role_mode="${1:-node}"
+        local hist_file="${HISTFILE:-$HOME/.bash_history}"
+
+        seed_manual_history "$role_mode"
         history -a 2>/dev/null || true
         history -w "$hist_file" 2>/dev/null || true
 
@@ -224,24 +280,17 @@ mod2_run() {
         local sudo_file="/etc/sudoers.d/90-${u}-nopasswd"
         printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$u" > "$sudo_file"
         chmod 0440 "$sudo_file"
-        if command -v visudo >/dev/null 2>&1 && ! visudo -cf "$sudo_file" >/dev/null 2>&1; then
-            printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$u" > "$sudo_file"
-            chmod 0440 "$sudo_file"
-        fi
     }
 
-    apply_client_resolv_search() {
+    apply_resolv_conf() {
         local resolv_file="/etc/resolv.conf"
-        local target_ns1="$1"
-        local target_ns2="$2"
+        local ns1="$1"
+        local ns2="$2"
 
-        if [ -L "$resolv_file" ]; then
-            chattr -i "$resolv_file" 2>/dev/null || true
-            rm -f "$resolv_file"
-        fi
         chattr -i "$resolv_file" 2>/dev/null || true
+        [ -L "$resolv_file" ] && rm -f "$resolv_file"
         printf "search %s %s\nnameserver %s\nnameserver %s\n" \
-            "$SEARCH_DOMAIN" "${AD_REALM,,}" "$target_ns1" "$target_ns2" > "$resolv_file"
+            "$SEARCH_DOMAIN" "${AD_REALM,,}" "$ns1" "$ns2" > "$resolv_file"
         chmod 0644 "$resolv_file"
         chattr +i "$resolv_file" 2>/dev/null || true
     }
@@ -251,36 +300,47 @@ mod2_run() {
         hn="$(hostname -s 2>/dev/null || hostname)"
         log "[$hn] Подготовка пакетов, модулей ядра и SSH..."
 
-        retry_cmd 3 2 apt-get update -y >/dev/null 2>&1 || warn "Ошибка apt-get update на $hn"
-
-        local base_pkgs="openssh-server openssh-clients sshpass python3 sudo nano curl wget ca-certificates chrony iptables iproute2 util-linux e2fsprogs"
-        retry_cmd 2 2 apt-get install -y $base_pkgs >/dev/null 2>&1 || warn "Часть базовых пакетов не установилась на $hn"
-
-        modprobe nfs 2>/dev/null || true
-        modprobe nfsv3 2>/dev/null || true
-        modprobe raid0 2>/dev/null || true
-        modprobe raid1 2>/dev/null || true
-        modprobe raid456 2>/dev/null || true
-        modprobe raid10 2>/dev/null || true
-
         if [[ "${hn,,}" == *isp* ]] || [[ "${hn,,}" == *rtr* ]]; then
-            ssh_user="net_admin"
+            ssh_user="$USER_ISP"
         else
-            ssh_user="sshuser"
+            ssh_user="$USER_HQ_SRV"
         fi
 
         if [[ "${hn,,}" == *hq-srv* ]]; then
             target_port="$SSH_PORT_HQ_SRV"
         elif [[ "${hn,,}" == *br-srv* ]]; then
             target_port="$SSH_PORT_BR_SRV"
+        elif [[ "${hn,,}" == *hq-cli* ]]; then
+            target_port="$SSH_PORT_HQ_CLI"
+        elif [[ "${hn,,}" == *isp* ]]; then
+            target_port="$SSH_PORT_ISP"
+        elif [[ "${hn,,}" == *hq-rtr* ]]; then
+            target_port="$SSH_PORT_HQ_RTR"
+        elif [[ "${hn,,}" == *br-rtr* ]]; then
+            target_port="$SSH_PORT_BR_RTR"
         else
             target_port="22"
         fi
 
+        local ans=""
+        read -r -p "Обновить пароль/пользователя/порт SSH на $hn? [y/N]: " ans
+        if [[ "${ans,,}" == "y" || "${ans,,}" == "yes" || "${ans,,}" == "д" || "${ans,,}" == "да" ]]; then
+            ssh_user=$(ask "Имя пользователя SSH на $hn" "$ssh_user")
+            target_port=$(ask "Порт SSH на $hn" "$target_port")
+            SSH_PASS=$(ask_secret "Новый пароль для $ssh_user" "$SSH_PASS")
+        fi
+
+        apt-get $APT_OPTS update -y >/dev/null 2>&1 || warn "Ошибка apt-get update на $hn"
+
+        local base_pkgs="openssh-server openssh-clients sshpass python3 sudo nano curl wget ca-certificates chrony iptables iproute2 util-linux e2fsprogs"
+        apt-get $APT_OPTS install -y $base_pkgs >/dev/null 2>&1 || warn "Часть базовых пакетов не установилась на $hn"
+
+        modprobe nfs nfsv3 raid0 raid1 raid456 raid10 2>/dev/null || true
+
         ensure_ssh_user_rights "$ssh_user"
 
         if [[ "${hn,,}" == *hq-cli* ]]; then
-            apply_client_resolv_search "$IP_BR_SRV" "$UPSTREAM_DNS"
+            apply_resolv_conf "$IP_BR_SRV" "$UPSTREAM_DNS"
         fi
 
         local sshd_cfg="/etc/openssh/sshd_config"
@@ -300,21 +360,21 @@ mod2_run() {
         fi
 
         systemctl enable --now sshd 2>/dev/null || systemctl enable --now ssh 2>/dev/null || true
-        retry_cmd 3 2 bash -c 'systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null' || true
+        systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
     }
 
     ssh_key_only() {
         local port="$1" target="$2"
         shift 2
         ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            -o ConnectTimeout=6 -p "$port" "$target" "$@"
+            -o ConnectTimeout=2 -p "$port" "$target" "$@"
     }
 
     scp_key_only() {
         local port="$1"
         shift
         scp -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            -o ConnectTimeout=6 -P "$port" "$@"
+            -o ConnectTimeout=2 -P "$port" "$@"
     }
 
     configure_samba_dc() {
@@ -323,11 +383,15 @@ mod2_run() {
         local br_fqdn="br-srv.${SEARCH_DOMAIN}"
 
         hostnamectl set-hostname "$br_fqdn" 2>/dev/null || hostname "$br_fqdn" 2>/dev/null || true
+        grep -qE "[[:space:]]${br_fqdn}([[:space:]]|$)" /etc/hosts || \
+            printf "%s %s br-srv\n" "$IP_BR_SRV" "$br_fqdn" >> /etc/hosts
+
+        apply_resolv_conf "$IP_HQ_SRV" "$UPSTREAM_DNS"
 
         if ! command -v samba-tool >/dev/null 2>&1; then
-            retry_cmd 2 2 apt-get install -y task-samba-dc samba-client samba-winbind krb5-kdc >/dev/null 2>&1 || \
-                retry_cmd 2 2 apt-get install -y samba-dc samba-client samba-winbind >/dev/null 2>&1 || \
-                retry_cmd 2 2 apt-get install -y samba samba-client >/dev/null 2>&1 || true
+            apt-get $APT_OPTS install -y task-samba-dc samba-client samba-winbind krb5-kdc >/dev/null 2>&1 || \
+                apt-get $APT_OPTS install -y samba-dc samba-client samba-winbind >/dev/null 2>&1 || \
+                apt-get $APT_OPTS install -y samba samba-client >/dev/null 2>&1 || true
         fi
 
         if ! command -v samba-tool >/dev/null 2>&1; then
@@ -343,9 +407,13 @@ mod2_run() {
 
             if ! samba-tool domain provision --use-rfc2307 --interactive=no \
                 --realm="$AD_REALM" --domain="$AD_DOMAIN" --adminpass="$AD_ADMIN_PASS" \
-                --dns-backend=SAMBA_INTERNAL --dns-forwarder="$IP_HQ_SRV" --server-role=dc >/dev/null 2>&1; then
-                printf -v "$reason_out_var" "samba: domain provision не прошёл"
-                return 1
+                --host-ip="$IP_BR_SRV" --dns-backend=SAMBA_INTERNAL --dns-forwarder="$IP_HQ_SRV" --server-role=dc >/dev/null 2>&1; then
+                if ! samba-tool domain provision --use-rfc2307 --interactive=no \
+                    --realm="$AD_REALM" --domain="$AD_DOMAIN" --adminpass="$AD_ADMIN_PASS" \
+                    --dns-backend=SAMBA_INTERNAL --dns-forwarder="$IP_HQ_SRV" --server-role=dc >/dev/null 2>&1; then
+                    printf -v "$reason_out_var" "samba: domain provision не прошёл"
+                    return 1
+                fi
             fi
         fi
 
@@ -353,37 +421,64 @@ mod2_run() {
             cp -f /var/lib/samba/private/krb5.conf /etc/krb5.conf 2>/dev/null || true
         fi
 
-        chattr -i /etc/resolv.conf 2>/dev/null || true
-        [ -L /etc/resolv.conf ] && rm -f /etc/resolv.conf
-        printf "search %s %s\nnameserver 127.0.0.1\nnameserver %s\n" \
-            "$SEARCH_DOMAIN" "${AD_REALM,,}" "$IP_HQ_SRV" > /etc/resolv.conf
-        chmod 0644 /etc/resolv.conf
-        chattr +i /etc/resolv.conf 2>/dev/null || true
+        apply_resolv_conf "127.0.0.1" "$IP_HQ_SRV"
 
         systemctl enable --now samba 2>/dev/null || systemctl enable --now samba-dc 2>/dev/null || true
-        if ! retry_cmd 5 2 bash -c 'systemctl is-active --quiet samba || systemctl is-active --quiet samba-dc || samba-tool dbcheck --cross-ncs >/dev/null 2>&1'; then
+        systemctl restart samba 2>/dev/null || systemctl restart samba-dc 2>/dev/null || true
+        if ! retry_cmd 2 1 bash -c 'systemctl is-active --quiet samba || systemctl is-active --quiet samba-dc || samba-tool dbcheck --cross-ncs >/dev/null 2>&1'; then
             printf -v "$reason_out_var" "samba: служба AD DC не запустилась"
             return 1
         fi
 
-        retry_cmd 3 2 samba-tool domain passwordsettings set \
+        samba-tool domain passwordsettings set \
             --min-pwd-length=8 --complexity=off \
             --account-lockout-threshold=5 --account-lockout-duration=30 --reset-account-lockout-after=30 >/dev/null 2>&1 || \
-            retry_cmd 3 2 samba-tool domain passwordsettings set --min-pwd-length=8 --account-lockout-threshold=5 >/dev/null 2>&1 || true
+            samba-tool domain passwordsettings set --min-pwd-length=8 --account-lockout-threshold=5 >/dev/null 2>&1 || true
 
-        retry_cmd 3 2 samba-tool group add "$HQ_GROUP" >/dev/null 2>&1 || true
+        samba-tool group add "$HQ_GROUP" >/dev/null 2>&1 || true
         for i in 1 2 3 4 5; do
             samba-tool user create "hquser${i}" "$HQ_USER_PASS" --must-change-at-next-login=no >/dev/null 2>&1 || \
                 samba-tool user setpassword "hquser${i}" --newpassword="$HQ_USER_PASS" >/dev/null 2>&1 || true
-            retry_cmd 3 1 samba-tool group addmembers "$HQ_GROUP" "hquser${i}" >/dev/null 2>&1 || true
+            samba-tool group addmembers "$HQ_GROUP" "hquser${i}" >/dev/null 2>&1 || true
         done
 
-        if retry_cmd 4 2 samba-tool group listmembers "$HQ_GROUP" >/dev/null 2>&1; then
+        if retry_cmd 2 1 samba-tool group listmembers "$HQ_GROUP" >/dev/null 2>&1; then
             return 0
         fi
 
         err="$(samba-tool dbcheck 2>&1 | tail -n 1 || true)"
         printf -v "$reason_out_var" "samba: группа $HQ_GROUP недоступна (${err:-проверь samba-tool})"
+        return 1
+    }
+
+    ensure_remote_user_and_key() {
+        local u="$1" h="$2" p="$3"
+        local pub_key="$4" ans_pub="$5"
+        local repair_cmd
+        repair_cmd="echo '${SSH_PASS}' | sudo -S true >/dev/null 2>&1 || true; \
+            echo '${SSH_PASS}' | sudo -S usermod -U '${u}' 2>/dev/null || true; \
+            echo '${SSH_PASS}' | sudo -S bash -c 'echo \"${u}:${SSH_PASS}\" | chpasswd; \
+            for g in wheel sudo; do getent group \$g >/dev/null 2>&1 && usermod -aG \$g \"${u}\" 2>/dev/null || true; done; \
+            printf \"%s ALL=(ALL:ALL) NOPASSWD: ALL\n\" \"${u}\" > \"/etc/sudoers.d/90-${u}-nopasswd\"; \
+            chmod 0440 \"/etc/sudoers.d/90-${u}-nopasswd\"; \
+            mkdir -p \"/home/${u}/.ssh\"; chmod 0700 \"/home/${u}/.ssh\"; \
+            touch \"/home/${u}/.ssh/authorized_keys\"; chmod 0600 \"/home/${u}/.ssh/authorized_keys\"; \
+            grep -qxF \"${pub_key}\" \"/home/${u}/.ssh/authorized_keys\" 2>/dev/null || echo \"${pub_key}\" >> \"/home/${u}/.ssh/authorized_keys\"; \
+            grep -qxF \"${ans_pub}\" \"/home/${u}/.ssh/authorized_keys\" 2>/dev/null || echo \"${ans_pub}\" >> \"/home/${u}/.ssh/authorized_keys\"; \
+            chown -R \"${u}:${u}\" \"/home/${u}\"'"
+
+        local attempt=1
+        while [ "$attempt" -le 2 ]; do
+            sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                -o NumberOfPasswordPrompts=1 -o ConnectTimeout=2 -o PreferredAuthentications=password \
+                -o PubkeyAuthentication=no -p "$p" "${u}@${h}" "$repair_cmd" >/dev/null 2>&1 || true
+
+            if ssh_key_only "$p" "$u@$h" "sudo -n true" >/dev/null 2>&1; then
+                return 0
+            fi
+            sleep 1
+            attempt=$((attempt + 1))
+        done
         return 1
     }
 
@@ -393,12 +488,28 @@ mod2_run() {
 
         IP_BR_SRV=$(ask "IP-адрес BR-SRV" "$IP_BR_SRV")
         IP_HQ_SRV=$(ask "IP-адрес HQ-SRV" "$IP_HQ_SRV")
+        USER_HQ_SRV=$(ask "Пользователь SSH на HQ-SRV" "$USER_HQ_SRV")
+        SSH_PORT_HQ_SRV=$(ask "Порт SSH на HQ-SRV" "$SSH_PORT_HQ_SRV")
+
         IP_HQ_CLI=$(ask "IP-адрес HQ-CLI" "$IP_HQ_CLI")
-        IP_HQ_RTR=$(ask "IP-адрес HQ-RTR" "$IP_HQ_RTR")
-        IP_BR_RTR=$(ask "IP-адрес BR-RTR" "$IP_BR_RTR")
+        USER_HQ_CLI=$(ask "Пользователь SSH на HQ-CLI" "$USER_HQ_CLI")
+        SSH_PORT_HQ_CLI=$(ask "Порт SSH на HQ-CLI" "$SSH_PORT_HQ_CLI")
+
         IP_ISP_EXT=$(ask "IP-адрес ISP" "$IP_ISP_EXT")
-        SSH_PORT_HQ_SRV=$(ask "SSH порт HQ-SRV" "$SSH_PORT_HQ_SRV")
-        SSH_PORT_BR_SRV=$(ask "SSH порт BR-SRV" "$SSH_PORT_BR_SRV")
+        USER_ISP=$(ask "Пользователь SSH на ISP" "$USER_ISP")
+        SSH_PORT_ISP=$(ask "Порт SSH на ISP" "$SSH_PORT_ISP")
+
+        IP_HQ_RTR=$(ask "IP-адрес HQ-RTR" "$IP_HQ_RTR")
+        USER_HQ_RTR=$(ask "Пользователь SSH на HQ-RTR" "$USER_HQ_RTR")
+        SSH_PORT_HQ_RTR=$(ask "Порт SSH на HQ-RTR" "$SSH_PORT_HQ_RTR")
+
+        IP_BR_RTR=$(ask "IP-адрес BR-RTR" "$IP_BR_RTR")
+        USER_BR_RTR=$(ask "Пользователь SSH на BR-RTR" "$USER_BR_RTR")
+        SSH_PORT_BR_RTR=$(ask "Порт SSH на BR-RTR" "$SSH_PORT_BR_RTR")
+
+        SSH_PORT_BR_SRV=$(ask "Порт SSH на BR-SRV" "$SSH_PORT_BR_SRV")
+        SSH_PASS=$(ask_secret "Пароль SSH/sudo для узлов" "$SSH_PASS")
+        AD_ADMIN_PASS=$(ask_secret "Пароль Administrator домена" "$AD_ADMIN_PASS")
         ISO_PATH=$(ask "Путь к Additional.iso" "$ISO_PATH")
         UPSTREAM_NTP=$(ask "Вышестоящий NTP для ISP" "$UPSTREAM_NTP")
 
@@ -416,7 +527,8 @@ mod2_run() {
             *) warn "Неизвестная ФС '$RAID_FS', используется ext4"; RAID_FS="ext4" ;;
         esac
 
-        # 1. Монтируем Additional.iso / sr0
+        apt-get $APT_OPTS update -y >/dev/null 2>&1 || true
+
         mkdir -p "$ISO_MOUNT"
         if [ -f "$ISO_PATH" ]; then
             mountpoint -q "$ISO_MOUNT" || mount -o loop "$ISO_PATH" "$ISO_MOUNT" 2>/dev/null || true
@@ -424,7 +536,6 @@ mod2_run() {
             mountpoint -q "$ISO_MOUNT" || mount -o ro /dev/sr0 "$ISO_MOUNT" 2>/dev/null || true
         fi
 
-        # 2. Раздаём SSH-ключи со всех узлов + проверяем/чиним права SSH-пользователей
         mkdir -p /root/.ssh && chmod 700 /root/.ssh
         [ -f /root/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N "" -f /root/.ssh/id_ed25519
         [ -f /root/.ssh/ansible ] || ssh-keygen -q -t ed25519 -N "" -f /root/.ssh/ansible
@@ -432,37 +543,17 @@ mod2_run() {
         pub_key="$(cat /root/.ssh/id_ed25519.pub)"
         ans_pub="$(cat /root/.ssh/ansible.pub)"
 
-        ensure_remote_user_and_key() {
-            local u="$1" h="$2" p="$3"
-            local repair_cmd
-            repair_cmd="sudo -n true >/dev/null 2>&1 || echo '${SSH_PASS}' | sudo -S true >/dev/null 2>&1; \
-                echo '${SSH_PASS}' | sudo -S usermod -U '${u}' 2>/dev/null || true; \
-                echo '${SSH_PASS}' | sudo -S bash -c 'echo \"${u}:${SSH_PASS}\" | chpasswd; \
-                for g in wheel sudo; do getent group \$g >/dev/null 2>&1 && usermod -aG \$g \"${u}\" 2>/dev/null || true; done; \
-                printf \"%s ALL=(ALL:ALL) NOPASSWD: ALL\n\" \"${u}\" > \"/etc/sudoers.d/90-${u}-nopasswd\"; \
-                chmod 0440 \"/etc/sudoers.d/90-${u}-nopasswd\"; \
-                mkdir -p \"/home/${u}/.ssh\"; chmod 0700 \"/home/${u}/.ssh\"; \
-                touch \"/home/${u}/.ssh/authorized_keys\"; chmod 0600 \"/home/${u}/.ssh/authorized_keys\"; \
-                grep -qxF \"${pub_key}\" \"/home/${u}/.ssh/authorized_keys\" 2>/dev/null || echo \"${pub_key}\" >> \"/home/${u}/.ssh/authorized_keys\"; \
-                grep -qxF \"${ans_pub}\" \"/home/${u}/.ssh/authorized_keys\" 2>/dev/null || echo \"${ans_pub}\" >> \"/home/${u}/.ssh/authorized_keys\"; \
-                chown -R \"${u}:${u}\" \"/home/${u}\"'"
-
-            retry_cmd 3 2 sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-                -o NumberOfPasswordPrompts=1 -o ConnectTimeout=6 -o PreferredAuthentications=password \
-                -o PubkeyAuthentication=no -p "$p" "${u}@${h}" "$repair_cmd" >/dev/null 2>&1 || true
-
-            if ! retry_cmd 3 2 ssh_key_only "$p" "$u@$h" "sudo -n true" >/dev/null 2>&1; then
-                retry_cmd 2 2 ssh_key_only "$p" "$u@$h" "mkdir -p ~/.ssh && chmod 700 ~/.ssh && grep -qxF '$pub_key' ~/.ssh/authorized_keys 2>/dev/null || echo '$pub_key' >> ~/.ssh/authorized_keys && grep -qxF '$ans_pub' ~/.ssh/authorized_keys 2>/dev/null || echo '$ans_pub' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" >/dev/null 2>&1 || true
-            fi
+        sync_all_keys() {
+            ensure_remote_user_and_key "$USER_ISP" "$IP_ISP_EXT" "$SSH_PORT_ISP" "$pub_key" "$ans_pub" || true
+            ensure_remote_user_and_key "$USER_HQ_SRV" "$IP_HQ_SRV" "$SSH_PORT_HQ_SRV" "$pub_key" "$ans_pub" || true
+            ensure_remote_user_and_key "$USER_HQ_CLI" "$IP_HQ_CLI" "$SSH_PORT_HQ_CLI" "$pub_key" "$ans_pub" || true
+            ensure_remote_user_and_key "$USER_HQ_RTR" "$IP_HQ_RTR" "$SSH_PORT_HQ_RTR" "$pub_key" "$ans_pub" || true
+            ensure_remote_user_and_key "$USER_BR_RTR" "$IP_BR_RTR" "$SSH_PORT_BR_RTR" "$pub_key" "$ans_pub" || true
         }
 
-        ensure_remote_user_and_key "net_admin" "$IP_ISP_EXT" "22"
-        ensure_remote_user_and_key "sshuser" "$IP_HQ_SRV" "$SSH_PORT_HQ_SRV"
-        ensure_remote_user_and_key "sshuser" "$IP_HQ_CLI" "22"
-        ensure_remote_user_and_key "net_admin" "$IP_HQ_RTR" "22"
-        ensure_remote_user_and_key "net_admin" "$IP_BR_RTR" "22"
+        sync_all_keys
 
-        # 3. [Задание 1 + Задание 6] Локальная настройка BR-SRV (ДО подключения клиентов)
+        # 3. [Задание 1 + Задание 6] Локальная настройка BR-SRV
         log "ПОДЛЮЧЕНИЕ BR-SRV (LOCAL)"
         local samba_ok="no" docker_ok="no" chrony_br_ok="no" br_reasons=() samba_reason=""
 
@@ -476,9 +567,10 @@ mod2_run() {
             br_reasons+=("${samba_reason:-samba не поднята}")
         fi
 
-        apt-get install -y docker-engine docker-compose-v2 2>/dev/null || apt-get install -y docker docker-compose 2>/dev/null || true
+        apt-get $APT_OPTS install -y docker-engine docker-compose-v2 2>/dev/null || \
+            apt-get $APT_OPTS install -y docker docker-compose 2>/dev/null || true
         systemctl enable --now docker 2>/dev/null || true
-        retry_cmd 4 2 systemctl is-active --quiet docker || true
+        systemctl restart docker 2>/dev/null || true
 
         local found_compose="" found_tar_dir=""
         if [ -d "$ISO_MOUNT" ]; then
@@ -508,7 +600,7 @@ services:
 YML
         fi
 
-        if retry_cmd 3 2 bash -c 'cd /root/testapp && (docker compose -p testapp up -d || docker compose up -d || docker-compose up -d)' >/dev/null 2>&1; then
+        if (cd /root/testapp && (docker compose -p testapp up -d || docker compose up -d || docker-compose up -d)) >/dev/null 2>&1; then
             docker_ok="yes"
         else
             br_reasons+=("docker: compose up не прошёл")
@@ -524,29 +616,22 @@ rtcsync
 EOF
         systemctl enable --now chronyd 2>/dev/null || systemctl enable --now chrony 2>/dev/null || true
         systemctl restart chronyd 2>/dev/null || systemctl restart chrony 2>/dev/null || true
-        if retry_cmd 3 1 bash -c 'systemctl is-active --quiet chronyd || systemctl is-active --quiet chrony'; then
+        if systemctl is-active --quiet chronyd 2>/dev/null || systemctl is-active --quiet chrony 2>/dev/null; then
             chrony_br_ok="yes"
         else
             br_reasons+=("chrony не активен")
         fi
 
         local br_reason_str=""
-        if [ "${#br_reasons[@]}" -gt 0 ]; then
-            br_reason_str="$(printf '%s; ' "${br_reasons[@]}")"
-            br_reason_str="${br_reason_str%; }"
-        fi
+        [ "${#br_reasons[@]}" -gt 0 ] && br_reason_str="$(printf '%s; ' "${br_reasons[@]}")" && br_reason_str="${br_reason_str%; }"
         summary_block "ПОДЛЮЧЕНИЕ BR-SRV (LOCAL)" "$br_reason_str" "samba - $samba_ok" "docker - $docker_ok" "chrony - $chrony_br_ok"
 
         # 4. [Задание 4] BR-SRV -> ISP
         log "ПОДЛЮЧЕНИЕ BR-SRV -> ISP"
         local isp_ping="no" isp_chrony="no" isp_ipt="no" isp_reasons=()
-        if retry_cmd 3 1 ping -c 1 -W 2 "$IP_ISP_EXT" >/dev/null 2>&1; then
-            isp_ping="yes"
-        else
-            isp_reasons+=("нет ping до $IP_ISP_EXT")
-        fi
+        ping -c 1 -W 1 "$IP_ISP_EXT" >/dev/null 2>&1 && isp_ping="yes" || isp_reasons+=("нет ping до $IP_ISP_EXT")
 
-        if retry_cmd 3 2 ssh_key_only "22" "net_admin@$IP_ISP_EXT" "sudo bash -s" <<EOF >/dev/null 2>&1
+        if ssh_key_only "$SSH_PORT_ISP" "$USER_ISP@$IP_ISP_EXT" "sudo bash -s" <<EOF >/dev/null 2>&1
 set -e
 CHRONY_CONF="/etc/chrony.conf"
 [ -f /etc/chrony/chrony.conf ] && CHRONY_CONF="/etc/chrony/chrony.conf"
@@ -569,25 +654,19 @@ EOF
             isp_reasons+=("chrony/ssh на ISP сбой")
         fi
 
-        if retry_cmd 3 2 ssh_key_only "22" "net_admin@$IP_ISP_EXT" "sudo iptables -L >/dev/null 2>&1" >/dev/null 2>&1; then
-            isp_ipt="yes"
-        else
-            isp_reasons+=("iptables недоступен на ISP")
-        fi
+        ssh_key_only "$SSH_PORT_ISP" "$USER_ISP@$IP_ISP_EXT" "sudo iptables -L >/dev/null 2>&1" >/dev/null 2>&1 && \
+            isp_ipt="yes" || isp_reasons+=("iptables недоступен на ISP")
+
         local isp_r=""
-        [ "${#isp_reasons[@]}" -gt 0 ] && isp_r="$(printf '%s; ' "${isp_reasons[@]}")"; isp_r="${isp_r%; }"
+        [ "${#isp_reasons[@]}" -gt 0 ] && isp_r="$(printf '%s; ' "${isp_reasons[@]}")" && isp_r="${isp_r%; }"
         summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> ISP" "$isp_r" "chrony - $isp_chrony" "ping - $isp_ping" "iptables - $isp_ipt"
 
         # 5. [Задание 8] BR-SRV -> HQ-RTR
         log "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-RTR"
         local hqrtr_ping="no" hqrtr_chrony="no" hqrtr_dnat="no" hqrtr_reasons=()
-        if retry_cmd 3 1 ping -c 1 -W 2 "$IP_HQ_RTR" >/dev/null 2>&1; then
-            hqrtr_ping="yes"
-        else
-            hqrtr_reasons+=("нет ping до $IP_HQ_RTR")
-        fi
+        ping -c 1 -W 1 "$IP_HQ_RTR" >/dev/null 2>&1 && hqrtr_ping="yes" || hqrtr_reasons+=("нет ping до $IP_HQ_RTR")
 
-        if retry_cmd 3 2 ssh_key_only "22" "net_admin@$IP_HQ_RTR" "sudo bash -s" <<EOF >/dev/null 2>&1
+        if ssh_key_only "$SSH_PORT_HQ_RTR" "$USER_HQ_RTR@$IP_HQ_RTR" "sudo bash -s" <<EOF >/dev/null 2>&1
 set -e
 CHRONY_CONF="/etc/chrony.conf"
 [ -f /etc/chrony/chrony.conf ] && CHRONY_CONF="/etc/chrony/chrony.conf"
@@ -607,7 +686,7 @@ EOF
             hqrtr_reasons+=("chrony/ssh на HQ-RTR сбой")
         fi
 
-        if retry_cmd 3 2 ssh_key_only "22" "net_admin@$IP_HQ_RTR" "sudo bash -s" <<EOF >/dev/null 2>&1
+        if ssh_key_only "$SSH_PORT_HQ_RTR" "$USER_HQ_RTR@$IP_HQ_RTR" "sudo bash -s" <<EOF >/dev/null 2>&1
 set -e
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
 grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
@@ -627,19 +706,15 @@ EOF
             hqrtr_reasons+=("dnat/iptables на HQ-RTR сбой")
         fi
         local hqrtr_r=""
-        [ "${#hqrtr_reasons[@]}" -gt 0 ] && hqrtr_r="$(printf '%s; ' "${hqrtr_reasons[@]}")"; hqrtr_r="${hqrtr_r%; }"
+        [ "${#hqrtr_reasons[@]}" -gt 0 ] && hqrtr_r="$(printf '%s; ' "${hqrtr_reasons[@]}")" && hqrtr_r="${hqrtr_r%; }"
         summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-RTR" "$hqrtr_r" "chrony - $hqrtr_chrony" "ping - $hqrtr_ping" "dnat - $hqrtr_dnat"
 
         # 6. [Задание 8] BR-SRV -> BR-RTR
         log "ПОДЛЮЧЕНИЕ BR-SRV -> BR-RTR"
         local brrtr_ping="no" brrtr_chrony="no" brrtr_dnat="no" brrtr_reasons=()
-        if retry_cmd 3 1 ping -c 1 -W 2 "$IP_BR_RTR" >/dev/null 2>&1; then
-            brrtr_ping="yes"
-        else
-            brrtr_reasons+=("нет ping до $IP_BR_RTR")
-        fi
+        ping -c 1 -W 1 "$IP_BR_RTR" >/dev/null 2>&1 && brrtr_ping="yes" || brrtr_reasons+=("нет ping до $IP_BR_RTR")
 
-        if retry_cmd 3 2 ssh_key_only "22" "net_admin@$IP_BR_RTR" "sudo bash -s" <<EOF >/dev/null 2>&1
+        if ssh_key_only "$SSH_PORT_BR_RTR" "$USER_BR_RTR@$IP_BR_RTR" "sudo bash -s" <<EOF >/dev/null 2>&1
 set -e
 CHRONY_CONF="/etc/chrony.conf"
 [ -f /etc/chrony/chrony.conf ] && CHRONY_CONF="/etc/chrony/chrony.conf"
@@ -659,7 +734,7 @@ EOF
             brrtr_reasons+=("chrony/ssh на BR-RTR сбой")
         fi
 
-        if retry_cmd 3 2 ssh_key_only "22" "net_admin@$IP_BR_RTR" "sudo bash -s" <<EOF >/dev/null 2>&1
+        if ssh_key_only "$SSH_PORT_BR_RTR" "$USER_BR_RTR@$IP_BR_RTR" "sudo bash -s" <<EOF >/dev/null 2>&1
 set -e
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
 grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
@@ -679,7 +754,7 @@ EOF
             brrtr_reasons+=("dnat/iptables на BR-RTR сбой")
         fi
         local brrtr_r=""
-        [ "${#brrtr_reasons[@]}" -gt 0 ] && brrtr_r="$(printf '%s; ' "${brrtr_reasons[@]}")"; brrtr_r="${brrtr_r%; }"
+        [ "${#brrtr_reasons[@]}" -gt 0 ] && brrtr_r="$(printf '%s; ' "${brrtr_reasons[@]}")" && brrtr_r="${brrtr_r%; }"
         summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> BR-RTR" "$brrtr_r" "chrony - $brrtr_chrony" "ping - $brrtr_ping" "dnat - $brrtr_dnat"
 
         # 7. [Задания 1(DNS SRV), 2, 3, 7] BR-SRV -> HQ-SRV
@@ -687,20 +762,27 @@ EOF
         local hqsrv_ping="no" hqsrv_raid="no" hqsrv_nfs="no" hqsrv_web="no" hqsrv_chrony="no" hqsrv_reasons=()
         local min_req_disks
         min_req_disks="$(raid_min_disks "$RAID_LEVEL")"
-        if retry_cmd 3 1 ping -c 1 -W 2 "$IP_HQ_SRV" >/dev/null 2>&1; then
-            hqsrv_ping="yes"
-        else
-            hqsrv_reasons+=("нет ping до $IP_HQ_SRV")
+        ping -c 1 -W 1 "$IP_HQ_SRV" >/dev/null 2>&1 && hqsrv_ping="yes" || hqsrv_reasons+=("нет ping до $IP_HQ_SRV")
+
+        if ! ssh_key_only "$SSH_PORT_HQ_SRV" "$USER_HQ_SRV@$IP_HQ_SRV" "sudo -n true" >/dev/null 2>&1; then
+            local fix_ans=""
+            read -r -p "SSH/sudo на $USER_HQ_SRV@$IP_HQ_SRV:$SSH_PORT_HQ_SRV не прошёл. Обновить параметры и перезаписать ключ? [Y/n]: " fix_ans
+            if [[ ! "${fix_ans,,}" =~ ^(n|no|н|нет)$ ]]; then
+                USER_HQ_SRV=$(ask "Пользователь SSH на HQ-SRV" "$USER_HQ_SRV")
+                SSH_PORT_HQ_SRV=$(ask "Порт SSH на HQ-SRV" "$SSH_PORT_HQ_SRV")
+                SSH_PASS=$(ask_secret "Пароль для $USER_HQ_SRV" "$SSH_PASS")
+                ensure_remote_user_and_key "$USER_HQ_SRV" "$IP_HQ_SRV" "$SSH_PORT_HQ_SRV" "$pub_key" "$ans_pub" || true
+            fi
         fi
 
-        if ! retry_cmd 3 2 ssh_key_only "$SSH_PORT_HQ_SRV" "sshuser@$IP_HQ_SRV" "sudo -n true" >/dev/null 2>&1; then
-            hqsrv_reasons+=("ssh по ключу/sudo на порт $SSH_PORT_HQ_SRV не прошёл")
+        if ! ssh_key_only "$SSH_PORT_HQ_SRV" "$USER_HQ_SRV@$IP_HQ_SRV" "sudo -n true" >/dev/null 2>&1; then
+            hqsrv_reasons+=("ssh по ключу/sudo на $USER_HQ_SRV@$IP_HQ_SRV:$SSH_PORT_HQ_SRV не прошёл")
         else
             if [ -d "$ISO_MOUNT/web" ]; then
-                scp_key_only "$SSH_PORT_HQ_SRV" -r "$ISO_MOUNT/web" "sshuser@$IP_HQ_SRV:/tmp/web_src" >/dev/null 2>&1 || true
+                scp_key_only "$SSH_PORT_HQ_SRV" -r "$ISO_MOUNT/web" "$USER_HQ_SRV@$IP_HQ_SRV:/tmp/web_src" >/dev/null 2>&1 || true
             fi
 
-            if retry_cmd 3 2 ssh_key_only "$SSH_PORT_HQ_SRV" "sshuser@$IP_HQ_SRV" "sudo bash -s" <<EOF >/dev/null 2>&1
+            if ssh_key_only "$SSH_PORT_HQ_SRV" "$USER_HQ_SRV@$IP_HQ_SRV" "sudo bash -s" <<EOF >/dev/null 2>&1
 CHRONY_CONF="/etc/chrony.conf"
 [ -f /etc/chrony/chrony.conf ] && CHRONY_CONF="/etc/chrony/chrony.conf"
 cat > "\$CHRONY_CONF" <<CHR
@@ -712,7 +794,6 @@ CHR
 systemctl enable --now chronyd 2>/dev/null || systemctl enable --now chrony 2>/dev/null || true
 systemctl restart chronyd 2>/dev/null || systemctl restart chrony 2>/dev/null || true
 
-# Опциональное добавление SRV/TXT записей Samba AD в зону BIND на HQ-SRV, если /etc/bind/zone/au-team.irpo существует
 ZONE_FILE="/etc/bind/zone/${SEARCH_DOMAIN}"
 if [ -f "\$ZONE_FILE" ] && ! grep -q "_kerberos._tcp.${SEARCH_DOMAIN}" "\$ZONE_FILE"; then
     cat >> "\$ZONE_FILE" <<SRV
@@ -732,18 +813,14 @@ EOF
             fi
 
             local raid_diag
-            raid_diag="$(ssh_key_only "$SSH_PORT_HQ_SRV" "sshuser@$IP_HQ_SRV" "sudo bash -s" <<EOF 2>/dev/null || true
-apt-get update -y >/dev/null 2>&1 || true
-apt-get install -y mdadm e2fsprogs >/dev/null 2>&1 || true
+            raid_diag="$(ssh_key_only "$SSH_PORT_HQ_SRV" "$USER_HQ_SRV@$IP_HQ_SRV" "sudo bash -s" <<EOF 2>/dev/null || true
+apt-get $APT_OPTS install -y mdadm e2fsprogs >/dev/null 2>&1 || true
 case "$RAID_FS" in
-    xfs)   apt-get install -y xfsprogs >/dev/null 2>&1 || true ;;
-    btrfs) apt-get install -y btrfsprogs >/dev/null 2>&1 || true ;;
+    xfs)   apt-get $APT_OPTS install -y xfsprogs >/dev/null 2>&1 || true ;;
+    btrfs) apt-get $APT_OPTS install -y btrfsprogs >/dev/null 2>&1 || true ;;
 esac
 
-modprobe raid0 2>/dev/null || true
-modprobe raid1 2>/dev/null || true
-modprobe raid456 2>/dev/null || true
-modprobe raid10 2>/dev/null || true
+modprobe raid0 raid1 raid456 raid10 2>/dev/null || true
 
 CANDIDATES=()
 while read -r name dtype size; do
@@ -820,10 +897,9 @@ EOF
                 hqsrv_reasons+=("raid: ${r_reason:-не смонтирован $RAID_MOUNT}")
             fi
 
-            ssh_key_only "$SSH_PORT_HQ_SRV" "sshuser@$IP_HQ_SRV" "sudo bash -s" <<EOF >/dev/null 2>&1 || true
-apt-get install -y nfs-server rpcbind >/dev/null 2>&1 || true
-modprobe nfs 2>/dev/null || true
-modprobe nfsv3 2>/dev/null || true
+            ssh_key_only "$SSH_PORT_HQ_SRV" "$USER_HQ_SRV@$IP_HQ_SRV" "sudo bash -s" <<EOF >/dev/null 2>&1 || true
+apt-get $APT_OPTS install -y nfs-server rpcbind >/dev/null 2>&1 || true
+modprobe nfs nfsv3 2>/dev/null || true
 control rpcbind server 2>/dev/null || true
 systemctl enable --now rpcbind >/dev/null 2>&1 || true
 systemctl restart rpcbind >/dev/null 2>&1 || true
@@ -834,12 +910,12 @@ grep -q "^$NFS_EXPORT_DIR[[:space:]]" /etc/exports || \
 exportfs -arv >/dev/null 2>&1 || true
 systemctl restart nfs-server >/dev/null 2>&1 || true
 
-apt-get install -y apache2 apache2-mod_php8.3 php8.3-mysqlnd-mysqli mariadb-server 2>/dev/null || \
-    apt-get install -y httpd2 mariadb-server php8.2 php8.2-mysql 2>/dev/null || true
+apt-get $APT_OPTS install -y apache2 apache2-mod_php8.3 php8.3-mysqlnd-mysqli mariadb-server 2>/dev/null || \
+    apt-get $APT_OPTS install -y httpd2 mariadb-server php8.2 php8.2-mysql 2>/dev/null || true
 systemctl enable --now mariadb >/dev/null 2>&1 || true
 systemctl enable --now httpd2 >/dev/null 2>&1 || systemctl enable --now apache2 >/dev/null 2>&1 || true
 
-for _ in {1..15}; do
+for _ in {1..5}; do
     mariadb-admin ping >/dev/null 2>&1 && break
     sleep 1
 done
@@ -865,58 +941,42 @@ if [ -d /tmp/web_src ]; then
 fi
 EOF
             local srv_out
-            srv_out="$(retry_cmd 3 2 ssh_key_only "$SSH_PORT_HQ_SRV" "sshuser@$IP_HQ_SRV" \
+            srv_out="$(ssh_key_only "$SSH_PORT_HQ_SRV" "$USER_HQ_SRV@$IP_HQ_SRV" \
                 "exportfs | grep -q '$NFS_EXPORT_DIR' && echo NFS_OK=yes || echo NFS_OK=no; (systemctl is-active --quiet httpd2 || systemctl is-active --quiet apache2) && echo WEB_OK=yes || echo WEB_OK=no" \
                 2>/dev/null || true)"
-            if [[ "$srv_out" == *"NFS_OK=yes"* ]]; then
-                hqsrv_nfs="yes"
-            else
-                hqsrv_reasons+=("nfs не экспортирован")
-            fi
-            if [[ "$srv_out" == *"WEB_OK=yes"* ]]; then
-                hqsrv_web="yes"
-            else
-                hqsrv_reasons+=("web-сервер не активен")
-            fi
+            [[ "$srv_out" == *"NFS_OK=yes"* ]] && hqsrv_nfs="yes" || hqsrv_reasons+=("nfs не экспортирован")
+            [[ "$srv_out" == *"WEB_OK=yes"* ]] && hqsrv_web="yes" || hqsrv_reasons+=("web-сервер не активен")
         fi
 
         local hqsrv_r=""
-        [ "${#hqsrv_reasons[@]}" -gt 0 ] && hqsrv_r="$(printf '%s; ' "${hqsrv_reasons[@]}")"; hqsrv_r="${hqsrv_r%; }"
+        [ "${#hqsrv_reasons[@]}" -gt 0 ] && hqsrv_r="$(printf '%s; ' "${hqsrv_reasons[@]}")" && hqsrv_r="${hqsrv_r%; }"
         summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-SRV" "$hqsrv_r" "raid - $hqsrv_raid ($RAID_LEVEL/$RAID_FS)" "nfs - $hqsrv_nfs" "web - $hqsrv_web" "chrony - $hqsrv_chrony" "ping - $hqsrv_ping"
 
-        # 8. [Задания 1, 3, 9] BR-SRV -> HQ-CLI (ввод в домен, sudo для группы hq, NFS, Яндекс Браузер)
+        # 8. [Задания 1, 3, 9] BR-SRV -> HQ-CLI
         log "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-CLI"
         local cli_ping="no" cli_ad="no" cli_nfs="no" cli_browser="no" cli_chrony="no" cli_reasons=()
-        if retry_cmd 3 1 ping -c 1 -W 2 "$IP_HQ_CLI" >/dev/null 2>&1; then
-            cli_ping="yes"
-        else
-            cli_reasons+=("нет ping до $IP_HQ_CLI")
-        fi
+        ping -c 1 -W 1 "$IP_HQ_CLI" >/dev/null 2>&1 && cli_ping="yes" || cli_reasons+=("нет ping до $IP_HQ_CLI")
 
         if [ -f /var/lib/samba/private/krb5.conf ]; then
-            scp_key_only "22" /var/lib/samba/private/krb5.conf "sshuser@$IP_HQ_CLI:/tmp/krb5.conf" >/dev/null 2>&1 || true
+            scp_key_only "$SSH_PORT_HQ_CLI" /var/lib/samba/private/krb5.conf "$USER_HQ_CLI@$IP_HQ_CLI:/tmp/krb5.conf" >/dev/null 2>&1 || true
         fi
 
-        ssh_key_only "22" "sshuser@$IP_HQ_CLI" "sudo bash -s" <<EOF >/dev/null 2>&1 || true
+        ssh_key_only "$SSH_PORT_HQ_CLI" "$USER_HQ_CLI@$IP_HQ_CLI" "sudo bash -s" <<EOF >/dev/null 2>&1 || true
 set -e
 systemctl stop avahi-daemon 2>/dev/null || true
 systemctl disable avahi-daemon 2>/dev/null || true
 
 grep -q "$IP_BR_SRV" /etc/hosts || echo "$IP_BR_SRV br-srv.${SEARCH_DOMAIN} br-srv.${AD_REALM,,} ${AD_REALM,,}" >> /etc/hosts
 
-if [ -L /etc/resolv.conf ]; then
-    chattr -i /etc/resolv.conf 2>/dev/null || true
-    rm -f /etc/resolv.conf
-fi
 chattr -i /etc/resolv.conf 2>/dev/null || true
+[ -L /etc/resolv.conf ] && rm -f /etc/resolv.conf
 printf "search %s %s\nnameserver %s\nnameserver %s\n" \
     "$SEARCH_DOMAIN" "${AD_REALM,,}" "$IP_BR_SRV" "$UPSTREAM_DNS" > /etc/resolv.conf
 chmod 0644 /etc/resolv.conf
 chattr +i /etc/resolv.conf 2>/dev/null || true
 
-apt-get update -y >/dev/null 2>&1 || true
-apt-get install -y task-auth-ad-sssd realmd sssd sssd-ad adcli nfs-clients rpcbind krb5-utils 2>/dev/null || \
-    apt-get install -y realmd sssd sssd-ad adcli nfs-clients rpcbind krb5 2>/dev/null || true
+apt-get $APT_OPTS install -y task-auth-ad-sssd realmd sssd sssd-ad adcli nfs-clients rpcbind krb5-utils 2>/dev/null || \
+    apt-get $APT_OPTS install -y realmd sssd sssd-ad adcli nfs-clients rpcbind krb5 2>/dev/null || true
 
 if [ -f /tmp/krb5.conf ]; then
     cp -f /tmp/krb5.conf /etc/krb5.conf
@@ -935,23 +995,18 @@ CHR
 systemctl enable --now chronyd 2>/dev/null || systemctl enable --now chrony 2>/dev/null || true
 systemctl restart chronyd 2>/dev/null || systemctl restart chrony 2>/dev/null || true
 
-modprobe nfs 2>/dev/null || true
-modprobe nfsv3 2>/dev/null || true
+modprobe nfs nfsv3 2>/dev/null || true
 systemctl enable --now rpcbind >/dev/null 2>&1 || true
 systemctl enable --now nfs-client.target 2>/dev/null || systemctl enable --now nfs-client 2>/dev/null || true
 
-n=1
-while [ "\$n" -le 3 ]; do
-    if net ads testjoin >/dev/null 2>&1 || realm list 2>/dev/null | grep -qiE "${SEARCH_DOMAIN}|hq\.local"; then
-        break
-    fi
+if ! net ads testjoin >/dev/null 2>&1 && ! realm list 2>/dev/null | grep -qiE "${SEARCH_DOMAIN}|hq\.local"; then
     if command -v system-auth >/dev/null 2>&1; then
-        system-auth write ad "${SEARCH_DOMAIN}" hq-cli "${AD_DOMAIN}" Administrator "${AD_ADMIN_PASS}" >/dev/null 2>&1 && break
+        system-auth write ad "${SEARCH_DOMAIN}" hq-cli "${AD_DOMAIN}" Administrator "${AD_ADMIN_PASS}" >/dev/null 2>&1 || true
     fi
-    echo "$AD_ADMIN_PASS" | realm join -U Administrator --client-software=sssd "${SEARCH_DOMAIN}" >/dev/null 2>&1 && break
-    sleep 2
-    n=\$((n + 1))
-done
+    if ! net ads testjoin >/dev/null 2>&1 && ! realm list 2>/dev/null | grep -qiE "${SEARCH_DOMAIN}|hq\.local"; then
+        echo "$AD_ADMIN_PASS" | realm join -U Administrator --client-software=sssd "${SEARCH_DOMAIN}" >/dev/null 2>&1 || true
+    fi
+fi
 realm permit --groups "$HQ_GROUP" >/dev/null 2>&1 || true
 
 control sudo public 2>/dev/null || true
@@ -968,12 +1023,7 @@ mkdir -p "$CLI_NFS_MOUNT" && chmod 777 "$CLI_NFS_MOUNT"
 grep -q "$IP_HQ_SRV:$NFS_EXPORT_DIR" /etc/fstab || \
     echo "$IP_HQ_SRV:$NFS_EXPORT_DIR $CLI_NFS_MOUNT nfs defaults 0 0" >> /etc/fstab
 
-n=1
-while [ "\$n" -le 3 ]; do
-    mount -a >/dev/null 2>&1 && mountpoint -q "$CLI_NFS_MOUNT" && break
-    sleep 2
-    n=\$((n + 1))
-done
+mount -a >/dev/null 2>&1 || true
 
 mkdir -p /etc/skel/.config/gtk-3.0
 echo "nfs://${IP_HQ_SRV}${NFS_EXPORT_DIR} NFS_Share" > /etc/skel/.config/gtk-3.0/bookmarks
@@ -988,41 +1038,25 @@ for uhome in /home/*; do
     fi
 done
 
-apt-get install -y yandex-browser 2>/dev/null || apt-get install -y yandex-browser-stable 2>/dev/null || true
+apt-get $APT_OPTS install -y yandex-browser 2>/dev/null || apt-get $APT_OPTS install -y yandex-browser-stable 2>/dev/null || true
 EOF
         local cli_out
-        cli_out="$(retry_cmd 3 2 ssh_key_only "22" "sshuser@$IP_HQ_CLI" \
+        cli_out="$(ssh_key_only "$SSH_PORT_HQ_CLI" "$USER_HQ_CLI@$IP_HQ_CLI" \
             "grep -q '^search ' /etc/resolv.conf && echo RES_OK=yes || echo RES_OK=no; (net ads testjoin >/dev/null 2>&1 || realm list 2>/dev/null | grep -qiE '${SEARCH_DOMAIN}|hq\.local') && echo AD_OK=yes || echo AD_OK=no; mountpoint -q '$CLI_NFS_MOUNT' && echo NFS_OK=yes || echo NFS_OK=no; (command -v yandex-browser >/dev/null 2>&1 || command -v yandex-browser-stable >/dev/null 2>&1 || rpm -q yandex-browser yandex-browser-stable >/dev/null 2>&1) && echo BR_OK=yes || echo BR_OK=no; (systemctl is-active --quiet chronyd || systemctl is-active --quiet chrony) && echo CH_OK=yes || echo CH_OK=no" \
             2>/dev/null || true)"
         [[ "$cli_out" == *"RES_OK=no"* ]] && cli_reasons+=("resolv.conf: нет строки search")
-        if [[ "$cli_out" == *"AD_OK=yes"* ]]; then
-            cli_ad="yes"
-        else
-            cli_reasons+=("domain: ввод в домен не выполнен (проверь DNS/KDC/SRV $SEARCH_DOMAIN)")
-        fi
-        if [[ "$cli_out" == *"NFS_OK=yes"* ]]; then
-            cli_nfs="yes"
-        else
-            cli_reasons+=("nfs: $CLI_NFS_MOUNT не смонтирован")
-        fi
-        if [[ "$cli_out" == *"BR_OK=yes"* ]]; then
-            cli_browser="yes"
-        else
-            cli_reasons+=("yandex-browser не найден")
-        fi
-        if [[ "$cli_out" == *"CH_OK=yes"* ]]; then
-            cli_chrony="yes"
-        else
-            cli_reasons+=("chrony на HQ-CLI не активен")
-        fi
+        [[ "$cli_out" == *"AD_OK=yes"* ]] && cli_ad="yes" || cli_reasons+=("domain: ввод в домен не выполнен (проверь DNS/KDC/SRV $SEARCH_DOMAIN)")
+        [[ "$cli_out" == *"NFS_OK=yes"* ]] && cli_nfs="yes" || cli_reasons+=("nfs: $CLI_NFS_MOUNT не смонтирован")
+        [[ "$cli_out" == *"BR_OK=yes"* ]] && cli_browser="yes" || cli_reasons+=("yandex-browser не найден")
+        [[ "$cli_out" == *"CH_OK=yes"* ]] && cli_chrony="yes" || cli_reasons+=("chrony на HQ-CLI не активен")
 
         local cli_r=""
-        [ "${#cli_reasons[@]}" -gt 0 ] && cli_r="$(printf '%s; ' "${cli_reasons[@]}")"; cli_r="${cli_r%; }"
+        [ "${#cli_reasons[@]}" -gt 0 ] && cli_r="$(printf '%s; ' "${cli_reasons[@]}")" && cli_r="${cli_r%; }"
         summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-CLI" "$cli_r" "domain - $cli_ad" "nfs - $cli_nfs" "browser - $cli_browser" "chrony - $cli_chrony" "ping - $cli_ping"
 
         # 9. [Задание 5] Ansible на BR-SRV
         log "ПОДЛЮЧЕНИЕ BR-SRV -> ANSIBLE (/etc/ansible)"
-        apt-get install -y ansible >/dev/null 2>&1 || true
+        apt-get $APT_OPTS install -y ansible >/dev/null 2>&1 || true
         mkdir -p /etc/ansible
         cat > /etc/ansible/ansible.cfg <<'EOF'
 [defaults]
@@ -1031,54 +1065,33 @@ host_key_checking = False
 interpreter_python = /usr/bin/python3
 deprecation_warnings = False
 command_warnings = False
-timeout = 15
+timeout = 5
 EOF
         cat > /etc/ansible/hosts <<EOF
 [servers]
-hq-srv ansible_host=$IP_HQ_SRV ansible_user=sshuser ansible_port=$SSH_PORT_HQ_SRV ansible_become=true ansible_become_method=sudo
+hq-srv ansible_host=$IP_HQ_SRV ansible_user=$USER_HQ_SRV ansible_port=$SSH_PORT_HQ_SRV ansible_become=true ansible_become_method=sudo
 
 [clients]
-hq-cli ansible_host=$IP_HQ_CLI ansible_user=sshuser ansible_port=22 ansible_become=true ansible_become_method=sudo
+hq-cli ansible_host=$IP_HQ_CLI ansible_user=$USER_HQ_CLI ansible_port=$SSH_PORT_HQ_CLI ansible_become=true ansible_become_method=sudo
 
 [routers]
-hq-rtr ansible_host=$IP_HQ_RTR ansible_user=net_admin ansible_port=22 ansible_become=true ansible_become_method=sudo
-br-rtr ansible_host=$IP_BR_RTR ansible_user=net_admin ansible_port=22 ansible_become=true ansible_become_method=sudo
+hq-rtr ansible_host=$IP_HQ_RTR ansible_user=$USER_HQ_RTR ansible_port=$SSH_PORT_HQ_RTR ansible_become=true ansible_become_method=sudo
+br-rtr ansible_host=$IP_BR_RTR ansible_user=$USER_BR_RTR ansible_port=$SSH_PORT_BR_RTR ansible_become=true ansible_become_method=sudo
 
 [all:vars]
 ansible_python_interpreter=/usr/bin/python3
 ansible_ssh_private_key_file=/root/.ssh/ansible
 EOF
         local ans_ok="no" ans_reason=""
-        if retry_cmd 2 2 ansible all -m ping; then
+        if ansible all -m ping; then
             ans_ok="yes"
         else
             ans_reason="один или несколько узлов недоступны по SSH/sudo (см. вывод ansible выше)"
         fi
         summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> ANSIBLE" "$ans_reason" "inventory - yes" "ping - $ans_ok"
 
-        # 10. Очистка истории и перезагрузка всех машин (сначала периферия, затем BR-SRV)
-        log "Сохранение истории, очистка строки запуска и перезагрузка всех машин..."
-
-        local remote_nodes=(
-            "net_admin@$IP_ISP_EXT:22"
-            "sshuser@$IP_HQ_SRV:$SSH_PORT_HQ_SRV"
-            "sshuser@$IP_HQ_CLI:22"
-            "net_admin@$IP_HQ_RTR:22"
-            "net_admin@$IP_BR_RTR:22"
-        )
-
-        for entry in "${remote_nodes[@]}"; do
-            local u_h="${entry%:*}" p="${entry#*:}"
-            ssh_key_only "$p" "$u_h" \
-                "history -a 2>/dev/null || true; history -w 2>/dev/null || true; sudo setsid sh -c 'sleep 2; /sbin/reboot -f || systemctl reboot -i' >/dev/null 2>&1 < /dev/null &" \
-                >/dev/null 2>&1 || true
-            sleep 1
-        done
-
-        sleep 4
-        save_history_clean
-        sync
-        reboot
+        save_history_clean "br-srv"
+        log "Готово (без принудительной перезагрузки)."
     }
 
     local ROLE
@@ -1089,7 +1102,7 @@ EOF
         run_br_srv_orchestration
     else
         prepare_base_node
-        save_history_clean
+        save_history_clean "node"
         log "Базовая подготовка узла завершена. Ожидайте запуск скрипта на BR-SRV."
     fi
 }
