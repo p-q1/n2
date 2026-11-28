@@ -1,4 +1,5 @@
 #!/bin/bash
+# Модуль 2 — Демо 2027 (ALT Linux)
 # Порядок запуска: сначала на всех узлах КРОМЕ BR-SRV, в самом конце — на BR-SRV.
 # Запуск: source /путь/к/скрипту.sh
 
@@ -405,7 +406,7 @@ systemctl enable --now iptables 2>/dev/null || true
 EOF
         summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> BR-RTR" "chrony - $brrtr_chrony, ping - $brrtr_ping, dnat - $brrtr_dnat"
 
-        # 7. [Задания 2, 3, 7] BR-SRV -> HQ-SRV (проверка дисков под RAID + ФС + NFS + Web)
+        # 7. [Задания 2, 3, 7] BR-SRV -> HQ-SRV
         log "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-SRV"
         local hqsrv_ping="no" hqsrv_raid="no" hqsrv_nfs="no" hqsrv_web="no" hqsrv_chrony="no"
         local min_req_disks
@@ -446,7 +447,6 @@ modprobe raid10 2>/dev/null || true
 CANDIDATES=()
 for dev in /dev/sd[b-z] /dev/vd[b-z] /dev/xvd[b-z] /dev/nvme[1-9]n1; do
     if [ -b "\$dev" ]; then
-        has_children=\$(lsblk -dn -o TYPE "\$dev" 2>/dev/null)
         part_cnt=\$(lsblk -ln "\$dev" 2>/dev/null | awk '\$6=="part"{c++} END{print c+0}')
         if ! findmnt -S "\$dev" >/dev/null 2>&1 && [ "\$part_cnt" -eq 0 ]; then
             CANDIDATES+=("\$dev")
@@ -460,14 +460,14 @@ echo "CANDIDATES_COUNT=\${#CANDIDATES[@]}"
 RAID_READY="no"
 SELECTED=()
 if [ "$RAID_LEVEL" = "10" ]; then
-    if [ \${#CANDIDATES[@]} -ge $min_req_disks ] && [ $(( \${#CANDIDATES[@]} % 2 )) -eq 0 ]; then
+    if [ "\${#CANDIDATES[@]}" -ge $min_req_disks ] && [ \$(( \${#CANDIDATES[@]} % 2 )) -eq 0 ]; then
         SELECTED=("\${CANDIDATES[@]}")
         RAID_READY="yes"
     else
         echo "RAID_REASON=нужно чётное число дисков >= $min_req_disks (найдено: \${#CANDIDATES[@]})"
     fi
 else
-    if [ \${#CANDIDATES[@]} -ge $min_req_disks ]; then
+    if [ "\${#CANDIDATES[@]}" -ge $min_req_disks ]; then
         SELECTED=("\${CANDIDATES[@]:0:$min_req_disks}")
         RAID_READY="yes"
     else
