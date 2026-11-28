@@ -64,11 +64,38 @@ mod2_run() {
         printf '\033[0;37m[%s]        %s\033[0m\n' "$(date '+%H:%M:%S')" "$*"
     }
 
+    color_yn() {
+        local val="$1"
+        if [ "$val" = "yes" ]; then
+            printf '\033[1;32myes\033[0m'
+        else
+            printf '\033[1;31mno\033[0m'
+        fi
+    }
+
     summary_block() {
         local title="$1"
         shift
+        local parts=()
+        while [ "$#" -gt 0 ]; do
+            local item="$1"
+            shift
+            if [[ "$item" == *" - yes"* ]]; then
+                local k="${item%% - yes*}"
+                local rest="${item#* - yes}"
+                parts+=("${k} - $(color_yn "yes")${rest}")
+            elif [[ "$item" == *" - no"* ]]; then
+                local k="${item%% - no*}"
+                local rest="${item#* - no}"
+                parts+=("${k} - $(color_yn "no")${rest}")
+            else
+                parts+=("$item")
+            fi
+        done
+        local joined
+        joined="$(IFS=', '; echo "${parts[*]}")"
         printf '\n\033[1;36m%s\033[0m\n' "$title"
-        printf '\033[1;37mИТОГИ: %s\033[0m\n' "$*"
+        printf '\033[1;37mИТОГИ:\033[0m %b\n' "$joined"
     }
 
     ask() {
@@ -237,7 +264,6 @@ mod2_run() {
             *) warn "Неизвестная ФС '$RAID_FS', используется ext4"; RAID_FS="ext4" ;;
         esac
 
-        # 1. Монтируем Additional.iso
         mkdir -p "$ISO_MOUNT"
         if [ -f "$ISO_PATH" ]; then
             mountpoint -q "$ISO_MOUNT" || mount -o loop "$ISO_PATH" "$ISO_MOUNT" || warn "Не удалось смонтировать $ISO_PATH"
@@ -245,7 +271,6 @@ mod2_run() {
             mountpoint -q "$ISO_MOUNT" || mount -o ro /dev/sr0 "$ISO_MOUNT" || warn "Не удалось смонтировать /dev/sr0"
         fi
 
-        # 2. Раздаём SSH-ключи со всех узлов
         mkdir -p /root/.ssh && chmod 700 /root/.ssh
         [ -f /root/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N "" -f /root/.ssh/id_ed25519
 
@@ -264,7 +289,6 @@ mod2_run() {
         push_key "net_admin" "$IP_HQ_RTR" "22"
         push_key "net_admin" "$IP_BR_RTR" "22"
 
-        # 3. [Задание 1 + Задание 6] Локальная настройка BR-SRV
         log "ПОДЛЮЧЕНИЕ BR-SRV (LOCAL)"
         local samba_ok="no" docker_ok="no" chrony_br_ok="no"
 
@@ -308,9 +332,8 @@ EOF
         systemctl restart chronyd 2>/dev/null || systemctl restart chrony 2>/dev/null || true
         (systemctl is-active --quiet chronyd || systemctl is-active --quiet chrony) && chrony_br_ok="yes"
 
-        summary_block "ПОДЛЮЧЕНИЕ BR-SRV (LOCAL)" "samba - $samba_ok, docker - $docker_ok, chrony - $chrony_br_ok"
+        summary_block "ПОДЛЮЧЕНИЕ BR-SRV (LOCAL)" "samba - $samba_ok" "docker - $docker_ok" "chrony - $chrony_br_ok"
 
-        # 4. [Задание 4] BR-SRV -> ISP
         log "ПОДЛЮЧЕНИЕ BR-SRV -> ISP"
         local isp_ping="no" isp_chrony="no" isp_ipt="no"
         if ping -c 1 -W 2 "$IP_ISP_EXT" >/dev/null 2>&1; then isp_ping="yes"; fi
@@ -334,9 +357,8 @@ systemctl is-active --quiet chronyd || systemctl is-active --quiet chrony
 EOF
 
         ssh_key_only "22" "net_admin@$IP_ISP_EXT" "sudo iptables -L >/dev/null 2>&1" >/dev/null 2>&1 && isp_ipt="yes"
-        summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> ISP" "chrony - $isp_chrony, ping - $isp_ping, iptables - $isp_ipt"
+        summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> ISP" "chrony - $isp_chrony" "ping - $isp_ping" "iptables - $isp_ipt"
 
-        # 5. [Задание 8] BR-SRV -> HQ-RTR
         log "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-RTR"
         local hqrtr_ping="no" hqrtr_chrony="no" hqrtr_dnat="no"
         if ping -c 1 -W 2 "$IP_HQ_RTR" >/dev/null 2>&1; then hqrtr_ping="yes"; fi
@@ -369,9 +391,8 @@ iptables -P FORWARD ACCEPT
 iptables-save > /etc/sysconfig/iptables 2>/dev/null || true
 systemctl enable --now iptables 2>/dev/null || true
 EOF
-        summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-RTR" "chrony - $hqrtr_chrony, ping - $hqrtr_ping, dnat - $hqrtr_dnat"
+        summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-RTR" "chrony - $hqrtr_chrony" "ping - $hqrtr_ping" "dnat - $hqrtr_dnat"
 
-        # 6. [Задание 8] BR-SRV -> BR-RTR
         log "ПОДЛЮЧЕНИЕ BR-SRV -> BR-RTR"
         local brrtr_ping="no" brrtr_chrony="no" brrtr_dnat="no"
         if ping -c 1 -W 2 "$IP_BR_RTR" >/dev/null 2>&1; then brrtr_ping="yes"; fi
@@ -404,9 +425,8 @@ iptables -P FORWARD ACCEPT
 iptables-save > /etc/sysconfig/iptables 2>/dev/null || true
 systemctl enable --now iptables 2>/dev/null || true
 EOF
-        summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> BR-RTR" "chrony - $brrtr_chrony, ping - $brrtr_ping, dnat - $brrtr_dnat"
+        summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> BR-RTR" "chrony - $brrtr_chrony" "ping - $brrtr_ping" "dnat - $brrtr_dnat"
 
-        # 7. [Задания 2, 3, 7] BR-SRV -> HQ-SRV
         log "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-SRV"
         local hqsrv_ping="no" hqsrv_raid="no" hqsrv_nfs="no" hqsrv_web="no" hqsrv_chrony="no"
         local min_req_disks
@@ -557,9 +577,8 @@ EOF
         [[ "$srv_out" == *"NFS_OK=yes"* ]] && hqsrv_nfs="yes"
         [[ "$srv_out" == *"WEB_OK=yes"* ]] && hqsrv_web="yes"
 
-        summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-SRV" "raid - $hqsrv_raid ($RAID_LEVEL/$RAID_FS), nfs - $hqsrv_nfs, web - $hqsrv_web, chrony - $hqsrv_chrony, ping - $hqsrv_ping"
+        summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-SRV" "raid - $hqsrv_raid ($RAID_LEVEL/$RAID_FS)" "nfs - $hqsrv_nfs" "web - $hqsrv_web" "chrony - $hqsrv_chrony" "ping - $hqsrv_ping"
 
-        # 8. [Задания 1, 3, 9] BR-SRV -> HQ-CLI
         log "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-CLI"
         local cli_ping="no" cli_ad="no" cli_nfs="no" cli_browser="no" cli_chrony="no"
         if ping -c 1 -W 2 "$IP_HQ_CLI" >/dev/null 2>&1; then cli_ping="yes"; fi
@@ -637,9 +656,8 @@ EOF
         [[ "$cli_out" == *"BR_OK=yes"* ]] && cli_browser="yes"
         [[ "$cli_out" == *"CH_OK=yes"* ]] && cli_chrony="yes"
 
-        summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-CLI" "domain - $cli_ad, nfs - $cli_nfs, browser - $cli_browser, chrony - $cli_chrony, ping - $cli_ping"
+        summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-CLI" "domain - $cli_ad" "nfs - $cli_nfs" "browser - $cli_browser" "chrony - $cli_chrony" "ping - $cli_ping"
 
-        # 9. [Задание 5] Ansible на BR-SRV
         log "ПОДЛЮЧЕНИЕ BR-SRV -> ANSIBLE (/etc/ansible)"
         apt-get install -y ansible >/dev/null 2>&1 || true
         mkdir -p /etc/ansible
@@ -673,9 +691,8 @@ br_rtr
 EOF
         local ans_ok="no"
         ansible targets -m ping && ans_ok="yes"
-        summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> ANSIBLE" "inventory - yes, ping - $ans_ok"
+        summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> ANSIBLE" "inventory - yes" "ping - $ans_ok"
 
-        # 10. Очистка истории и перезагрузка всех машин (сначала периферия, затем BR-SRV)
         log "Сохранение истории, очистка строки запуска и перезагрузка всех машин..."
 
         local remote_nodes=(
