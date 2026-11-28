@@ -29,6 +29,7 @@ mod2_run() {
     local HQ_CLI_NET="192.168.200.0/28"
 
     local UPSTREAM_DNS="8.8.8.8"
+    local SEARCH_DOMAIN="au-team.irpo"
     local SSH_PORT_HQ_SRV="2027"
     local SSH_PORT_BR_SRV="2027"
     local SSH_PASS="P@ssw0rd"
@@ -158,6 +159,79 @@ mod2_run() {
         fi
     }
 
+    ensure_ssh_user_rights() {
+        local u="$1"
+        local user_home user_shell
+
+        if id "$u" >/dev/null 2>&1; then
+            info_line "Пользователь '$u' существует — проверяем шелл, разблокировку, пароль и sudo..."
+            usermod -U "$u" 2>/dev/null || true
+            user_shell="$(getent passwd "$u" | cut -d: -f7)"
+            case "$user_shell" in
+                */nologin|*/false|"") usermod -s /bin/bash "$u" 2>/dev/null || true ;;
+            esac
+        else
+            info_line "Пользователь '$u' не найден — создаём..."
+            useradd -m -s /bin/bash "$u"
+        fi
+
+        user_home="$(getent passwd "$u" | cut -d: -f6)"
+        if [ -z "${user_home:-}" ]; then
+            user_home="/home/$u"
+            mkdir -p "$user_home"
+            usermod -d "$user_home" "$u" 2>/dev/null || true
+        fi
+        mkdir -p "$user_home/.ssh"
+        chmod 0700 "$user_home/.ssh"
+        touch "$user_home/.ssh/authorized_keys"
+        chmod 0600 "$user_home/.ssh/authorized_keys"
+        chown -R "$u":"$u" "$user_home" 2>/dev/null || true
+
+        echo "${u}:${SSH_PASS}" | chpasswd
+
+        for grp in wheel sudo; do
+            if getent group "$grp" >/dev/null 2>&1; then
+                usermod -aG "$grp" "$u" 2>/dev/null || true
+            fi
+        done
+
+        # Убираем возможные конфликтующие правила запрета или без NOPASSWD в /etc/sudoers.d
+        local sudo_file="/etc/sudoers.d/90-${u}-nopasswd"
+        printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$u" > "$sudo_file"
+        chmod 0440 "$sudo_file"
+
+        if command -v visudo >/dev/null 2>&1; then
+            if ! visudo -cf "$sudo_file" >/dev/null 2>&1; then
+                warn "Ошибка синтаксиса в $sudo_file — восстанавливаем"
+                printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$u" > "$sudo_file"
+                chmod 0440 "$sudo_file"
+            fi
+        fi
+
+        if su -s /bin/bash - "$u" -c "sudo -n true" >/dev/null 2>&1; then
+            info_line "Права sudo без пароля для '$u': OK"
+        else
+            warn "Права sudo без пароля для '$u' не прошли проверку (проверьте /etc/sudoers)"
+        fi
+    }
+
+    apply_client_resolv_search() {
+        local resolv_file="/etc/resolv.conf"
+        local target_ns1="$1"
+        local target_ns2="$2"
+
+        if [ -L "$resolv_file" ]; then
+            chattr -i "$resolv_file" 2>/dev/null || true
+            rm -f "$resolv_file"
+        fi
+        chattr -i "$resolv_file" 2>/dev/null || true
+
+        printf "search %s\nnameserver %s\nnameserver %s\n" "$SEARCH_DOMAIN" "$target_ns1" "$target_ns2" > "$resolv_file"
+        chmod 0644 "$resolv_file"
+        # Защищаем от перезаписи DHCP/сетевыми скриптами
+        chattr +i "$resolv_file" 2>/dev/null || true
+    }
+
     prepare_base_node() {
         local hn ssh_user target_port
         hn="$(hostname -s 2>/dev/null || hostname)"
@@ -165,7 +239,7 @@ mod2_run() {
 
         apt-get update -y >/dev/null 2>&1 || warn "Ошибка apt-get update на $hn"
 
-        local base_pkgs="openssh-server openssh-clients sshpass python3 sudo nano curl wget ca-certificates chrony iptables iproute2 util-linux"
+        local base_pkgs="openssh-server openssh-clients sshpass python3 sudo nano curl wget ca-certificates chrony iptables iproute2 util-linux e2fsprogs"
         apt-get install -y $base_pkgs >/dev/null 2>&1 || warn "Часть базовых пакетов не установилась на $hn"
 
         modprobe nfs 2>/dev/null || true
@@ -189,18 +263,11 @@ mod2_run() {
             target_port="22"
         fi
 
-        if ! id "$ssh_user" >/dev/null 2>&1; then
-            useradd -m -s /bin/bash "$ssh_user"
-        fi
-        echo "${ssh_user}:${SSH_PASS}" | chpasswd
+        ensure_ssh_user_rights "$ssh_user"
 
-        for grp in wheel sudo; do
-            if getent group "$grp" >/dev/null 2>&1; then
-                usermod -aG "$grp" "$ssh_user" 2>/dev/null || true
-            fi
-        done
-        printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$ssh_user" > "/etc/sudoers.d/90-${ssh_user}-nopasswd"
-        chmod 0440 "/etc/sudoers.d/90-${ssh_user}-nopasswd"
+        if [[ "${hn,,}" == *hq-cli* ]]; then
+            apply_client_resolv_search "$IP_BR_SRV" "$UPSTREAM_DNS"
+        fi
 
         local sshd_cfg="/etc/openssh/sshd_config"
         [ -f "$sshd_cfg" ] || sshd_cfg="/etc/ssh/sshd_config"
@@ -208,6 +275,7 @@ mod2_run() {
         if [ -f "$sshd_cfg" ]; then
             sed -i 's/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/' "$sshd_cfg"
             sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' "$sshd_cfg"
+            sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin yes/' "$sshd_cfg"
             if ! grep -Eq "^[[:space:]]*Port[[:space:]]+${target_port}\b" "$sshd_cfg"; then
                 if grep -Eq "^[[:space:]]*#?[[:space:]]*Port[[:space:]]+" "$sshd_cfg"; then
                     sed -i "s/^[[:space:]]*#*[[:space:]]*Port[[:space:]].*/Port ${target_port}/" "$sshd_cfg"
@@ -264,6 +332,7 @@ mod2_run() {
             *) warn "Неизвестная ФС '$RAID_FS', используется ext4"; RAID_FS="ext4" ;;
         esac
 
+        # 1. Монтируем Additional.iso
         mkdir -p "$ISO_MOUNT"
         if [ -f "$ISO_PATH" ]; then
             mountpoint -q "$ISO_MOUNT" || mount -o loop "$ISO_PATH" "$ISO_MOUNT" || warn "Не удалось смонтировать $ISO_PATH"
@@ -271,24 +340,42 @@ mod2_run() {
             mountpoint -q "$ISO_MOUNT" || mount -o ro /dev/sr0 "$ISO_MOUNT" || warn "Не удалось смонтировать /dev/sr0"
         fi
 
+        # 2. Раздаём SSH-ключи со всех узлов (предварительно проверяя/восстанавливая права ssh-пользователя по SSH)
         mkdir -p /root/.ssh && chmod 700 /root/.ssh
         [ -f /root/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N "" -f /root/.ssh/id_ed25519
+        local pub_key
+        pub_key="$(cat /root/.ssh/id_ed25519.pub)"
 
-        push_key() {
+        ensure_remote_user_and_key() {
             local u="$1" h="$2" p="$3"
+            local repair_cmd
+            repair_cmd="sudo -n true >/dev/null 2>&1 || echo '${SSH_PASS}' | sudo -S true >/dev/null 2>&1; \
+                echo '${SSH_PASS}' | sudo -S usermod -U '${u}' 2>/dev/null || true; \
+                echo '${SSH_PASS}' | sudo -S bash -c 'echo \"${u}:${SSH_PASS}\" | chpasswd; \
+                for g in wheel sudo; do getent group \$g >/dev/null 2>&1 && usermod -aG \$g \"${u}\" 2>/dev/null || true; done; \
+                printf \"%s ALL=(ALL:ALL) NOPASSWD: ALL\n\" \"${u}\" > \"/etc/sudoers.d/90-${u}-nopasswd\"; \
+                chmod 0440 \"/etc/sudoers.d/90-${u}-nopasswd\"; \
+                mkdir -p \"/home/${u}/.ssh\"; chmod 0700 \"/home/${u}/.ssh\"; \
+                touch \"/home/${u}/.ssh/authorized_keys\"; chmod 0600 \"/home/${u}/.ssh/authorized_keys\"; \
+                grep -qxF \"${pub_key}\" \"/home/${u}/.ssh/authorized_keys\" 2>/dev/null || echo \"${pub_key}\" >> \"/home/${u}/.ssh/authorized_keys\"; \
+                chown -R \"${u}:${u}\" \"/home/${u}\"'"
+
             sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
                 -o NumberOfPasswordPrompts=1 -o ConnectTimeout=6 -o PreferredAuthentications=password \
-                -o PubkeyAuthentication=no -p "$p" "${u}@${h}" \
-                "mkdir -p ~/.ssh && chmod 700 ~/.ssh && grep -qxF '$(cat /root/.ssh/id_ed25519.pub)' ~/.ssh/authorized_keys 2>/dev/null || echo '$(cat /root/.ssh/id_ed25519.pub)' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" \
-                >/dev/null 2>&1 || true
+                -o PubkeyAuthentication=no -p "$p" "${u}@${h}" "$repair_cmd" >/dev/null 2>&1 || true
+
+            if ! ssh_key_only "$p" "$u@$h" "sudo -n true" >/dev/null 2>&1; then
+                ssh_key_only "$p" "$u@$h" "mkdir -p ~/.ssh && chmod 700 ~/.ssh && grep -qxF '$pub_key' ~/.ssh/authorized_keys 2>/dev/null || echo '$pub_key' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" >/dev/null 2>&1 || true
+            fi
         }
 
-        push_key "net_admin" "$IP_ISP_EXT" "22"
-        push_key "sshuser" "$IP_HQ_SRV" "$SSH_PORT_HQ_SRV"
-        push_key "sshuser" "$IP_HQ_CLI" "22"
-        push_key "net_admin" "$IP_HQ_RTR" "22"
-        push_key "net_admin" "$IP_BR_RTR" "22"
+        ensure_remote_user_and_key "net_admin" "$IP_ISP_EXT" "22"
+        ensure_remote_user_and_key "sshuser" "$IP_HQ_SRV" "$SSH_PORT_HQ_SRV"
+        ensure_remote_user_and_key "sshuser" "$IP_HQ_CLI" "22"
+        ensure_remote_user_and_key "net_admin" "$IP_HQ_RTR" "22"
+        ensure_remote_user_and_key "net_admin" "$IP_BR_RTR" "22"
 
+        # 3. [Задание 1 + Задание 6] Локальная настройка BR-SRV
         log "ПОДЛЮЧЕНИЕ BR-SRV (LOCAL)"
         local samba_ok="no" docker_ok="no" chrony_br_ok="no"
 
@@ -334,6 +421,7 @@ EOF
 
         summary_block "ПОДЛЮЧЕНИЕ BR-SRV (LOCAL)" "samba - $samba_ok" "docker - $docker_ok" "chrony - $chrony_br_ok"
 
+        # 4. [Задание 4] BR-SRV -> ISP
         log "ПОДЛЮЧЕНИЕ BR-SRV -> ISP"
         local isp_ping="no" isp_chrony="no" isp_ipt="no"
         if ping -c 1 -W 2 "$IP_ISP_EXT" >/dev/null 2>&1; then isp_ping="yes"; fi
@@ -359,6 +447,7 @@ EOF
         ssh_key_only "22" "net_admin@$IP_ISP_EXT" "sudo iptables -L >/dev/null 2>&1" >/dev/null 2>&1 && isp_ipt="yes"
         summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> ISP" "chrony - $isp_chrony" "ping - $isp_ping" "iptables - $isp_ipt"
 
+        # 5. [Задание 8] BR-SRV -> HQ-RTR
         log "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-RTR"
         local hqrtr_ping="no" hqrtr_chrony="no" hqrtr_dnat="no"
         if ping -c 1 -W 2 "$IP_HQ_RTR" >/dev/null 2>&1; then hqrtr_ping="yes"; fi
@@ -393,6 +482,7 @@ systemctl enable --now iptables 2>/dev/null || true
 EOF
         summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-RTR" "chrony - $hqrtr_chrony" "ping - $hqrtr_ping" "dnat - $hqrtr_dnat"
 
+        # 6. [Задание 8] BR-SRV -> BR-RTR
         log "ПОДЛЮЧЕНИЕ BR-SRV -> BR-RTR"
         local brrtr_ping="no" brrtr_chrony="no" brrtr_dnat="no"
         if ping -c 1 -W 2 "$IP_BR_RTR" >/dev/null 2>&1; then brrtr_ping="yes"; fi
@@ -427,6 +517,7 @@ systemctl enable --now iptables 2>/dev/null || true
 EOF
         summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> BR-RTR" "chrony - $brrtr_chrony" "ping - $brrtr_ping" "dnat - $brrtr_dnat"
 
+        # 7. [Задания 2, 3, 7] BR-SRV -> HQ-SRV
         log "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-SRV"
         local hqsrv_ping="no" hqsrv_raid="no" hqsrv_nfs="no" hqsrv_web="no" hqsrv_chrony="no"
         local min_req_disks
@@ -579,6 +670,7 @@ EOF
 
         summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-SRV" "raid - $hqsrv_raid ($RAID_LEVEL/$RAID_FS)" "nfs - $hqsrv_nfs" "web - $hqsrv_web" "chrony - $hqsrv_chrony" "ping - $hqsrv_ping"
 
+        # 8. [Задания 1, 3, 9] BR-SRV -> HQ-CLI
         log "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-CLI"
         local cli_ping="no" cli_ad="no" cli_nfs="no" cli_browser="no" cli_chrony="no"
         if ping -c 1 -W 2 "$IP_HQ_CLI" >/dev/null 2>&1; then cli_ping="yes"; fi
@@ -593,7 +685,15 @@ systemctl stop avahi-daemon 2>/dev/null || true
 systemctl disable avahi-daemon 2>/dev/null || true
 
 grep -q "$IP_BR_SRV" /etc/hosts || echo "$IP_BR_SRV br-srv.hq.local hq.local" >> /etc/hosts
-printf "nameserver %s\nnameserver %s\n" "$IP_BR_SRV" "$UPSTREAM_DNS" > /etc/resolv.conf
+
+if [ -L /etc/resolv.conf ]; then
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+    rm -f /etc/resolv.conf
+fi
+chattr -i /etc/resolv.conf 2>/dev/null || true
+printf "search %s\nnameserver %s\nnameserver %s\n" "$SEARCH_DOMAIN" "$IP_BR_SRV" "$UPSTREAM_DNS" > /etc/resolv.conf
+chmod 0644 /etc/resolv.conf
+chattr +i /etc/resolv.conf 2>/dev/null || true
 
 apt-get update -y >/dev/null 2>&1 || true
 apt-get install -y realmd sssd sssd-ad adcli nfs-clients rpcbind krb5 2>/dev/null || \
@@ -658,6 +758,7 @@ EOF
 
         summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> HQ-CLI" "domain - $cli_ad" "nfs - $cli_nfs" "browser - $cli_browser" "chrony - $cli_chrony" "ping - $cli_ping"
 
+        # 9. [Задание 5] Ansible на BR-SRV
         log "ПОДЛЮЧЕНИЕ BR-SRV -> ANSIBLE (/etc/ansible)"
         apt-get install -y ansible >/dev/null 2>&1 || true
         mkdir -p /etc/ansible
@@ -693,6 +794,7 @@ EOF
         ansible targets -m ping && ans_ok="yes"
         summary_block "ПОДЛЮЧЕНИЕ BR-SRV -> ANSIBLE" "inventory - yes" "ping - $ans_ok"
 
+        # 10. Очистка истории и перезагрузка всех машин (сначала периферия, затем BR-SRV)
         log "Сохранение истории, очистка строки запуска и перезагрузка всех машин..."
 
         local remote_nodes=(
